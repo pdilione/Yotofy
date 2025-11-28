@@ -1,2 +1,189 @@
-�jh��,�jh��2�)���e�"�����-��������b�j�a�)���R��b ����
-��z{bj["��+�+vZb��+���ky�鞞��y�7�gZ��b�覦��u�^�)�
+import os
+import sys
+import json
+import logging
+import time
+import random
+import spotipy
+from spotipy.oauth2 import SpotifyClientCredentials
+import yt_dlp
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from email.utils import formatdate
+
+# Configure Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Configuration
+PUBLIC_URL = os.environ.get('PUBLIC_URL', 'http://localhost:8000')
+AUDIO_DIR = 'public/audio'
+
+def ensure_dir(directory):
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+
+def get_spotify_client():
+    client_id = os.environ.get('SPOTIFY_CLIENT_ID')
+    client_secret = os.environ.get('SPOTIFY_CLIENT_SECRET')
+    if not client_id or not client_secret:
+        logger.error("Missing SPOTIFY_CLIENT_ID or SPOTIFY_CLIENT_SECRET")
+        sys.exit(1)
+    return spotipy.Spotify(auth_manager=SpotifyClientCredentials(client_id=client_id, client_secret=client_secret))
+
+def get_youtube_cookies():
+    """Helper to parse cookies from env var if present"""
+    cookie_str = os.environ.get('YOUTUBE_COOKIES')
+    if not cookie_str:
+        return None
+    
+    # Save to a temporary file
+    cookie_file = 'cookies.txt'
+    with open(cookie_file, 'w') as f:
+        f.write(cookie_str)
+    return cookie_file
+
+def download_audio(query, filename, cookie_file=None):
+    output_path = os.path.join(AUDIO_DIR, filename)
+    if os.path.exists(output_path):
+        logger.info(f"File exists, skipping: {filename}")
+        return True
+
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'outtmpl': output_path,
+        'postprocessors': [{
+            'key': 'FFmpegExtractAudio',
+            'preferredcodec': 'mp3',
+            'preferredquality': '192',
+        }],
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True, # Critical: Don't crash on one failed download
+        'nocheckcertificate': True,
+        # Anti-bot options
+        'sleep_interval_requests': 1,
+        'sleep_interval': 2,
+        'max_sleep_interval': 10,
+    }
+
+    if cookie_file:
+        ydl_opts['cookiefile'] = cookie_file
+        logger.info("Using provided cookies for authentication")
+
+    logger.info(f"Downloading: {query}")
+    
+    # Retry Logic
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            # Random sleep to act human
+            time.sleep(random.uniform(2, 7))
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([f"ytsearch1:{query}"])
+            
+            # Check if file exists (success)
+            # Note: FFmpeg conversion changes extension, so check likely candidates
+            if os.path.exists(output_path) or os.path.exists(output_path.replace('.mp3', '.webm')) or os.path.exists(output_path.replace('.mp3', '.m4a')):
+                return True
+            else:
+                 logger.warning(f"Download finished but file not found (might be ignored error). Attempt {attempt+1}/{max_retries}")
+        except Exception as e:
+            logger.warning(f"Download attempt {attempt+1} failed: {e}")
+            time.sleep(10) # Wait longer on failure
+    
+    return False
+
+def generate_rss(playlist_meta, tracks):
+    rss = ET.Element('rss', version='2.0')
+    channel = ET.SubElement(rss, 'channel')
+    
+    ET.SubElement(channel, 'title').text = playlist_meta['name']
+    ET.SubElement(channel, 'description').text = playlist_meta['description']
+    ET.SubElement(channel, 'link').text = PUBLIC_URL
+    
+    # Image
+    if playlist_meta['images']:
+        image = ET.SubElement(channel, 'image')
+        ET.SubElement(image, 'url').text = playlist_meta['images'][0]['url']
+        ET.SubElement(image, 'title').text = playlist_meta['name']
+        ET.SubElement(image, 'link').text = PUBLIC_URL
+
+    for item in tracks:
+        track = item['track']
+        if not track: continue
+
+        # Verify file exists before adding to RSS
+        filename = f"{track['id']}.mp3"
+        file_path = os.path.join(AUDIO_DIR, filename)
+        
+        # Check for generated file
+        if not os.path.exists(file_path):
+             logger.warning(f"Skipping RSS entry for {filename} (File not found locally)")
+             continue
+
+        item_el = ET.SubElement(channel, 'item')
+        track_name = track['name']
+        artist_name = track['artists'][0]['name']
+        file_url = f"{PUBLIC_URL}/audio/{filename}"
+        
+        ET.SubElement(item_el, 'title').text = track_name
+        ET.SubElement(item_el, 'description').text = f"Artist: {artist_name}"
+        ET.SubElement(item_el, 'enclosure', url=file_url, type='audio/mpeg')
+        ET.SubElement(item_el, 'guid').text = track['id']
+        ET.SubElement(item_el, 'pubDate').text = formatdate(datetime.now().timestamp())
+
+    tree = ET.ElementTree(rss)
+    ET.indent(tree, space="\t", level=0)
+    
+    # Save to public root
+    output_file = 'public/podcast.xml'
+    ensure_dir('public')
+    tree.write(output_file, encoding='utf-8', xml_declaration=True)
+    logger.info(f"Generated {output_file}")
+
+def main():
+    playlist_id = os.environ.get('SPOTIFY_PLAYLIST_ID')
+    if not playlist_id:
+        logger.error("Missing SPOTIFY_PLAYLIST_ID")
+        sys.exit(1)
+
+    ensure_dir(AUDIO_DIR)
+    
+    sp = get_spotify_client()
+    cookie_file = get_youtube_cookies()
+    
+    try:
+        results = sp.playlist(playlist_id)
+        playlist_meta = {
+            'name': results['name'],
+            'description': results['description'],
+            'images': results['images']
+        }
+        tracks = results['tracks']['items']
+        
+        logger.info(f"Found {len(tracks)} tracks in playlist: {playlist_meta['name']}")
+
+        for item in tracks:
+            track = item['track']
+            if not track: continue
+            
+            query = f"{track['name']} {track['artists'][0]['name']} audio"
+            filename = f"{track['id']}.mp3"
+            download_audio(query, filename, cookie_file)
+
+        generate_rss(playlist_meta, tracks)
+        
+        # Cleanup cookies
+        if cookie_file and os.path.exists(cookie_file):
+            os.remove(cookie_file)
+            
+        logger.info("Sync complete.")
+
+    except Exception as e:
+        logger.error(f"Sync failed: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
