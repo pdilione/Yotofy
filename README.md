@@ -71,18 +71,17 @@ Once the action completes successfully:
 ## Troubleshooting
 
 ### "Sign in to confirm you’re not a bot" Error
-If you see this error in the GitHub Action logs, YouTube is blocking the server.
+This means YouTube is blocking the GitHub server IP. To fix this, you must "log in" using cookies.
 
-**Option 1 (Usually works):**
-Just retry the workflow. The updated script uses random pauses and retry logic which often bypasses this check.
-
-**Option 2 (Advanced - Use Cookies):**
-If Option 1 fails repeatedly, you can provide your browser cookies to "log in" the script.
-1. Install a "Get cookies.txt" extension for your browser (Chrome/Firefox).
-2. Go to YouTube and ensure you are logged out (or use a dummy account).
-3. Use the extension to download `cookies.txt`.
-4. Open the file, copy the **entire text content**.
-5. Go to GitHub Repo -> Settings -> Secrets -> New Secret.
-6. Name: `YOUTUBE_COOKIES`.
-7. Value: Paste the text content.
-8. Re-run the workflow.
+**Step-by-Step Fix:**
+1.  Install the **"Get cookies.txt LOCALLY"** extension for Chrome or Firefox.
+    *   [Chrome Link](https://chrome.google.com/webstore/detail/get-cookiestxt-locally/cclelndahbckbenkjhflccpebjkmnlkj)
+2.  Go to **YouTube.com** and make sure you are logged out (or use a throwaway account).
+3.  Click the extension icon and click **"Export"** (it downloads a `cookies.txt` file).
+4.  Open that file with a text editor (Notepad, TextEdit).
+5.  **Select All** text and **Copy**.
+6.  Go to your GitHub Repo -> **Settings** -> **Secrets and variables** -> **Actions**.
+7.  Click **"New repository secret"**.
+8.  **Name**: `YOUTUBE_COOKIES`
+9.  **Secret**: Paste the entire text content.
+10. Re-run the Workflow.

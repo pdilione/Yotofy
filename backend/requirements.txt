@@ -1,2 +1,2 @@
 spotipy
-yt-dlp>=2024.04.09
+yt-dlp
