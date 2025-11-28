@@ -1,0 +1,5 @@
+{
+  "name": "Yotofy - Spotify to Yoto Sync",
+  "description": "A concept tool to visualize syncing Spotify playlists to Yoto cards, leveraging Gemini to generate custom pixel art icons for your physical cards.",
+  "requestFramePermissions": []
+}
