@@ -91,13 +91,13 @@ const App: React.FC = () => {
   // Simulation Logic
   const simulateSpotifyUpdate = () => {
     if (!connections.spotify) {
-      alert("Connect Spotify first!");
+      addLog('System', 'Connect Spotify first!', 'warning');
       return;
     }
 
     const syncedPlaylists = playlists.filter(p => p.syncConfig?.enabled);
     if (syncedPlaylists.length === 0) {
-      alert("Enable Auto-Sync on at least one playlist first.");
+      addLog('System', 'Enable Auto-Sync on at least one playlist first.', 'warning');
       return;
     }
 
