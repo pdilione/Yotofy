@@ -21,12 +21,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger("yotofy-sync")
 
-# Environment & Paths
+# Environment & Paths (defaults to /music and /data volumes when mounted in Docker)
+_DEFAULT_MUSIC_DIR = "/music" if Path("/music").exists() else "public/audio"
+_DEFAULT_DATA_DIR = "/data" if Path("/data").exists() else "backend"
+
 YOTO_API_BASE = os.environ.get("YOTO_API_BASE", "https://api.yotoplay.com")
-AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", "public/audio"))
-CACHE_DB_PATH = Path(os.environ.get("CACHE_DB_PATH", "backend/sync_cache.db"))
-CACHE_JSON_PATH = Path(os.environ.get("CACHE_JSON_PATH", "backend/sync_cache.json"))
-ZOTIFY_CREDENTIALS_PATH = Path(os.environ.get("ZOTIFY_CREDENTIALS_PATH", "credentials.json"))
+AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", _DEFAULT_MUSIC_DIR))
+CACHE_DB_PATH = Path(os.environ.get("CACHE_DB_PATH", f"{_DEFAULT_DATA_DIR}/sync_cache.db"))
+CACHE_JSON_PATH = Path(os.environ.get("CACHE_JSON_PATH", f"{_DEFAULT_DATA_DIR}/sync_cache.json"))
+ZOTIFY_CREDENTIALS_PATH = Path(os.environ.get("ZOTIFY_CREDENTIALS_PATH", f"{_DEFAULT_DATA_DIR}/credentials.json"))
 
 
 class TrackSyncCache:

@@ -1,0 +1,15 @@
+node_modules
+dist
+.git
+.github
+.env
+.env.*
+!.env.example
+data
+music
+public
+backend/__pycache__
+backend/*.db
+backend/*.json
+*.log
+.DS_Store

@@ -1,0 +1,41 @@
+services:
+  yotofy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yotofy:latest
+    container_name: yotofy-stack
+    restart: unless-stopped
+    ports:
+      - "${UI_PORT:-3000}:3000"   # Vite/React UI (proxies /api/* to FastAPI)
+      - "${API_PORT:-8000}:8000" # FastAPI Python Backend API & OpenAPI docs (/docs)
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - UI_PORT=3000
+      - API_PORT=8000
+      - AUDIO_DIR=/music
+      - DATA_DIR=/data
+      - CACHE_DB_PATH=/data/sync_cache.db
+      - CACHE_JSON_PATH=/data/sync_cache.json
+      - ZOTIFY_CREDENTIALS_PATH=/data/credentials.json
+      - FRONTEND_DIST_DIR=/app/dist
+      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
+      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
+      - SPOTIFY_PLAYLIST_ID=${SPOTIFY_PLAYLIST_ID:-}
+      - ZOTIFY_CREDENTIALS_JSON=${ZOTIFY_CREDENTIALS_JSON:-}
+      - YOTO_ACCESS_TOKEN=${YOTO_ACCESS_TOKEN:-}
+      - YOTO_CARD_ID=${YOTO_CARD_ID:-}
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+    volumes:
+      # Persistent SQLite sync cache (sync_cache.db / sync_cache.json) and credentials.json
+      - ./data:/data
+      # Persistent local MP3 music library downloaded via Zotify
+      - ./music:/music
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8000/api/health && curl -sf http://127.0.0.1:3000/ > /dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
