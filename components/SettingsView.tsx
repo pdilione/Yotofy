@@ -558,47 +558,63 @@ export const SettingsView: React.FC<Props> = ({
                 <div className="text-xs font-bold text-white flex items-center gap-1.5">
                   <Disc size={14} className="text-yoto-orange" />
                   <span>
-                    Existing Yoto MYO Cards &amp; Playlists (<code>GET /content/mine</code>)
+                    Target Yoto MYO Playlist (<code>GET /content/mine</code>)
                   </span>
                 </div>
                 <span className="text-[11px] text-yoto-orange font-mono font-bold">
-                  {statusInfo.yotoCards.length} found
+                  {statusInfo.yotoCards.length} existing cards
                 </span>
               </div>
 
-              {statusInfo.yotoCards.length > 0 ? (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
-                  {statusInfo.yotoCards.map((card) => (
-                    <div
-                      key={card.cardId}
-                      onClick={() =>
-                        setLocalSettings({ ...localSettings, yotoCardId: card.cardId })
-                      }
-                      className={`p-2.5 rounded-lg border text-xs cursor-pointer transition-colors flex items-center justify-between ${
-                        localSettings.yotoCardId === card.cardId
-                          ? 'bg-yoto-orange/15 border-yoto-orange text-white'
-                          : 'bg-white/5 border-white/5 text-gray-300 hover:bg-white/10'
-                      }`}
-                    >
-                      <div className="min-w-0 pr-2">
-                        <div className="font-semibold text-white truncate">{card.title}</div>
-                        <div className="text-[10px] text-gray-400 font-mono truncate">
-                          cardId: {card.cardId}
-                          {card.trackCount ? ` • ${card.trackCount} tracks` : ''}
-                        </div>
-                      </div>
-                      <span className="text-[10px] text-yoto-orange shrink-0 font-semibold">
-                        {localSettings.yotoCardId === card.cardId ? 'Selected' : 'Use ID'}
-                      </span>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-56 overflow-y-auto pr-1">
+                <div
+                  onClick={() =>
+                    setLocalSettings({ ...localSettings, yotoCardId: '' })
+                  }
+                  className={`p-2.5 rounded-lg border text-xs cursor-pointer transition-colors flex items-center justify-between ${
+                    !localSettings.yotoCardId
+                      ? 'bg-yoto-orange/20 border-yoto-orange text-white'
+                      : 'bg-white/5 border-white/10 text-gray-300 hover:bg-white/10'
+                  }`}
+                >
+                  <div className="min-w-0 pr-2">
+                    <div className="font-bold text-yoto-orange truncate">
+                      + Create New Yoto Playlist
                     </div>
-                  ))}
+                    <div className="text-[10px] text-gray-400 truncate">
+                      Creates a brand-new MYO card on sync
+                    </div>
+                  </div>
+                  <span className="text-[10px] text-yoto-orange shrink-0 font-semibold">
+                    {!localSettings.yotoCardId ? 'Default' : 'Select'}
+                  </span>
                 </div>
-              ) : (
-                <div className="text-xs text-gray-500">
-                  Connected and verified via <code>GET https://api.yotoplay.com/content/mine</code>{' '}
-                  — no existing MYO cards found in your Yoto account yet.
-                </div>
-              )}
+
+                {statusInfo.yotoCards.map((card) => (
+                  <div
+                    key={card.cardId}
+                    onClick={() =>
+                      setLocalSettings({ ...localSettings, yotoCardId: card.cardId })
+                    }
+                    className={`p-2.5 rounded-lg border text-xs cursor-pointer transition-colors flex items-center justify-between ${
+                      localSettings.yotoCardId === card.cardId
+                        ? 'bg-yoto-orange/15 border-yoto-orange text-white'
+                        : 'bg-white/5 border-white/5 text-gray-300 hover:bg-white/10'
+                    }`}
+                  >
+                    <div className="min-w-0 pr-2">
+                      <div className="font-semibold text-white truncate">{card.title}</div>
+                      <div className="text-[10px] text-gray-400 font-mono truncate">
+                        cardId: {card.cardId}
+                        {card.trackCount ? ` • ${card.trackCount} tracks` : ''}
+                      </div>
+                    </div>
+                    <span className="text-[10px] text-yoto-orange shrink-0 font-semibold">
+                      {localSettings.yotoCardId === card.cardId ? 'Selected' : 'Use ID'}
+                    </span>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>
@@ -696,17 +712,22 @@ export const SettingsView: React.FC<Props> = ({
 
           <div>
             <label className="block text-[10px] uppercase text-gray-400 font-bold mb-1">
-              Default Target Yoto Card ID (Optional)
+              Default Target Yoto Playlist
             </label>
-            <input
-              type="text"
+            <select
               value={localSettings.yotoCardId || ''}
               onChange={(e) =>
                 setLocalSettings({ ...localSettings, yotoCardId: e.target.value })
               }
-              className="w-full bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-white text-sm focus:border-yoto-orange focus:outline-none"
-              placeholder="e.g. 73shQ"
-            />
+              className="w-full bg-gray-950 border border-white/15 rounded-lg px-3 py-2.5 text-white text-xs font-medium focus:border-yoto-orange focus:outline-none"
+            >
+              <option value="">+ Create New Yoto Playlist (Default per Spotify Playlist)</option>
+              {statusInfo.yotoCards.map((card) => (
+                <option key={card.cardId} value={card.cardId}>
+                  {card.title} ({card.cardId})
+                </option>
+              ))}
+            </select>
           </div>
         </div>
 

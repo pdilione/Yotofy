@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { Playlist, Track, AppSettings, ActivityLog } from '../types';
+import { Playlist, Track, AppSettings, ActivityLog, YotoMyoCard } from '../types';
 import { YotoDisplay } from './YotoDisplay';
-import { getPlaylists, triggerSync } from '../services/api';
+import { getPlaylists, getStatus, triggerSync } from '../services/api';
 import {
   CheckCircle,
   RefreshCw,
@@ -12,14 +12,23 @@ import {
   Radio,
   Hash,
   AlertCircle,
+  PlusCircle,
+  Disc,
 } from 'lucide-react';
+
+const CREATE_NEW_OPTION = '__create_new__';
 
 interface Props {
   playlist: Playlist;
   onBack: () => void;
-  onPlaylistSynced: (updatedPlaylist: Playlist, updatedActivity?: ActivityLog[]) => void;
+  onPlaylistSynced: (
+    updatedPlaylist: Playlist,
+    updatedActivity?: ActivityLog[],
+    updatedYotoCards?: YotoMyoCard[]
+  ) => void;
   connected: boolean;
   settings: AppSettings;
+  yotoCards?: YotoMyoCard[];
 }
 
 export const SyncView: React.FC<Props> = ({
@@ -28,34 +37,51 @@ export const SyncView: React.FC<Props> = ({
   onPlaylistSynced,
   connected,
   settings,
+  yotoCards = [],
 }) => {
   const [currentPlaylist, setCurrentPlaylist] = useState<Playlist>(playlist);
+  const [availableYotoCards, setAvailableYotoCards] = useState<YotoMyoCard[]>(yotoCards);
+  const [targetSelection, setTargetSelection] = useState<string>(() =>
+    playlist.syncConfig?.targetYotoId || CREATE_NEW_OPTION
+  );
+  const [newPlaylistTitle, setNewPlaylistTitle] = useState<string>(playlist.name);
   const [syncing, setSyncing] = useState<boolean>(false);
   const [syncError, setSyncError] = useState<string | null>(null);
   const [autoSyncEnabled, setAutoSyncEnabled] = useState<boolean>(
-    Boolean(playlist.syncConfig?.enabled)
+    Boolean(playlist.syncConfig?.enabled ?? true)
   );
 
   const emptyGrid = new Array(256).fill('#111111');
 
-  // Refresh real playlist state from /api/playlists on mount
+  useEffect(() => {
+    setAvailableYotoCards(yotoCards);
+  }, [yotoCards]);
+
+  // Refresh real playlist state and Yoto MYO cards on mount
   useEffect(() => {
     let mounted = true;
     setCurrentPlaylist(playlist);
-    setAutoSyncEnabled(Boolean(playlist.syncConfig?.enabled));
+    setNewPlaylistTitle(playlist.name);
+    setTargetSelection(playlist.syncConfig?.targetYotoId || CREATE_NEW_OPTION);
+    setAutoSyncEnabled(Boolean(playlist.syncConfig?.enabled ?? true));
 
-    getPlaylists()
-      .then((list) => {
-        if (!mounted) return;
-        const fresh = list.find((p) => p.id === playlist.id);
-        if (fresh) {
-          setCurrentPlaylist(fresh);
-          setAutoSyncEnabled(Boolean(fresh.syncConfig?.enabled));
+    Promise.all([
+      getPlaylists().catch(() => []),
+      getStatus().catch(() => null),
+    ]).then(([list, statusRes]) => {
+      if (!mounted) return;
+      const fresh = list.find((p) => p.id === playlist.id);
+      if (fresh) {
+        setCurrentPlaylist(fresh);
+        if (fresh.syncConfig?.targetYotoId) {
+          setTargetSelection(fresh.syncConfig.targetYotoId);
         }
-      })
-      .catch(() => {
-        // Keep currentPlaylist prop if fetch fails
-      });
+        setAutoSyncEnabled(Boolean(fresh.syncConfig?.enabled ?? true));
+      }
+      if (statusRes && Array.isArray(statusRes.yotoCards)) {
+        setAvailableYotoCards(statusRes.yotoCards);
+      }
+    });
 
     return () => {
       mounted = false;
@@ -66,22 +92,45 @@ export const SyncView: React.FC<Props> = ({
   const cachedCount = tracks.filter((t) => t.inLocalCache && t.transcodedSha256).length;
   const uncachedCount = tracks.length - cachedCount;
   const isSynced = Boolean(currentPlaylist.syncConfig?.enabled);
+  const isCreatingNew = targetSelection === CREATE_NEW_OPTION;
+
+  const mappedCardId = currentPlaylist.syncConfig?.targetYotoId;
+  const hasMappedInList = Boolean(
+    mappedCardId && availableYotoCards.some((c) => c.cardId === mappedCardId)
+  );
 
   const handleSync = async () => {
     if (!connected || syncing) return;
     setSyncing(true);
     setSyncError(null);
 
+    const createNew = targetSelection === CREATE_NEW_OPTION;
+    const trimmedTitle = newPlaylistTitle.trim() || currentPlaylist.name;
+
     try {
       const result = await triggerSync({
         playlistId: currentPlaylist.id,
         autoSync: autoSyncEnabled,
-        targetYotoId: currentPlaylist.syncConfig?.targetYotoId || settings.yotoCardId,
+        createNew,
+        targetYotoId: createNew ? undefined : targetSelection,
+        customTitle: createNew ? trimmedTitle : undefined,
       });
+
+      const returnedCardId =
+        result.cardId || result.playlist?.syncConfig?.targetYotoId;
+
+      if (Array.isArray(result.yotoCards)) {
+        setAvailableYotoCards(result.yotoCards);
+      }
 
       if (result.playlist) {
         setCurrentPlaylist(result.playlist);
-        onPlaylistSynced(result.playlist, result.activity);
+        if (returnedCardId) {
+          setTargetSelection(returnedCardId);
+        }
+        onPlaylistSynced(result.playlist, result.activity, result.yotoCards);
+      } else if (returnedCardId) {
+        setTargetSelection(returnedCardId);
       }
     } catch (err) {
       setSyncError(err instanceof Error ? err.message : 'Sync failed');
@@ -102,7 +151,7 @@ export const SyncView: React.FC<Props> = ({
             &larr; Back
           </button>
           <h2 className="text-2xl font-bold text-white flex items-center">
-            {currentPlaylist.imageUrl && (
+            {currentPlaylist.imageUrl && currentPlaylist.imageUrl.trim() && (
               <img
                 src={currentPlaylist.imageUrl}
                 alt={currentPlaylist.name}
@@ -187,7 +236,7 @@ export const SyncView: React.FC<Props> = ({
                     <span className="text-gray-500 w-7 text-center text-xs font-mono">
                       {idx + 1}
                     </span>
-                    {track.imageUrl && (
+                    {track.imageUrl && track.imageUrl.trim() && (
                       <img
                         src={track.imageUrl}
                         alt={track.title}
@@ -229,8 +278,8 @@ export const SyncView: React.FC<Props> = ({
         </div>
 
         {/* Right: Yoto Sync Control */}
-        <div className="flex flex-col items-center justify-between p-6 bg-gradient-to-b from-gray-800 to-gray-900 rounded-2xl border border-white/5 relative overflow-hidden">
-          <div className="w-full flex justify-between items-center z-10 mb-2">
+        <div className="flex flex-col items-center justify-between p-6 bg-gradient-to-b from-gray-800 to-gray-900 rounded-2xl border border-white/5 relative overflow-hidden space-y-4">
+          <div className="w-full flex justify-between items-center z-10">
             <div className="flex items-center space-x-2">
               <div
                 className={`w-3 h-3 rounded-full ${
@@ -242,18 +291,65 @@ export const SyncView: React.FC<Props> = ({
                 }`}
               />
               <span className="text-gray-200 text-xs font-bold uppercase tracking-widest">
-                {syncing ? 'Syncing with Yoto API...' : isSynced ? 'Synced' : 'Not Synced'}
+                {syncing ? 'Syncing with Yoto API...' : isSynced ? 'Synced' : 'Ready to Sync'}
               </span>
             </div>
             {currentPlaylist.syncConfig?.targetYotoId && (
               <span className="text-xs font-mono text-yoto-orange bg-yoto-orange/10 px-2.5 py-1 rounded-full border border-yoto-orange/30 flex items-center gap-1">
                 <Link size={12} />
-                {currentPlaylist.syncConfig.targetYotoId}
+                cardId: {currentPlaylist.syncConfig.targetYotoId}
               </span>
             )}
           </div>
 
-          <div className="w-48 sm:w-56 my-4">
+          {/* Target Yoto Playlist Dropdown + Create New Option (Placed at Top of Panel) */}
+          <div className="w-full bg-black/40 rounded-xl p-4 border border-yoto-orange/30 space-y-3">
+            <div>
+              <label className="block text-xs font-bold text-white mb-1.5 flex items-center gap-1.5">
+                <Disc size={14} className="text-yoto-orange" />
+                <span>Target Yoto MYO Playlist</span>
+              </label>
+              <select
+                value={targetSelection}
+                onChange={(e) => setTargetSelection(e.target.value)}
+                className="w-full bg-gray-900 border border-white/20 rounded-lg px-3 py-2.5 text-white text-xs font-semibold focus:border-yoto-orange focus:outline-none"
+              >
+                <option value={CREATE_NEW_OPTION}>+ Create New Yoto Playlist</option>
+                {mappedCardId && !hasMappedInList && (
+                  <option value={mappedCardId}>
+                    Mapped MYO Playlist ({mappedCardId})
+                  </option>
+                )}
+                {availableYotoCards.map((card) => (
+                  <option key={card.cardId} value={card.cardId}>
+                    {card.title} ({card.cardId})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {isCreatingNew && (
+              <div>
+                <label className="block text-[11px] font-bold text-yoto-orange mb-1 flex items-center gap-1">
+                  <PlusCircle size={12} />
+                  <span>New Yoto Playlist Title</span>
+                </label>
+                <input
+                  type="text"
+                  value={newPlaylistTitle}
+                  onChange={(e) => setNewPlaylistTitle(e.target.value)}
+                  placeholder={currentPlaylist.name}
+                  className="w-full bg-white/10 border border-white/20 rounded-lg px-3 py-2 text-white text-xs focus:border-yoto-orange focus:outline-none"
+                />
+                <p className="text-[10px] text-gray-400 mt-1">
+                  Creates a brand-new MYO playlist on Yoto (omitting <code>cardId</code>) and saves
+                  the new <code>cardId</code> for future syncs.
+                </p>
+              </div>
+            )}
+          </div>
+
+          <div className="w-36 sm:w-44">
             <YotoDisplay
               iconGrid={currentPlaylist.generatedIcon || emptyGrid}
               themeColor={currentPlaylist.themeColor || '#FF6D00'}
@@ -261,7 +357,7 @@ export const SyncView: React.FC<Props> = ({
             />
           </div>
 
-          <div className="w-full max-w-md space-y-3">
+          <div className="w-full space-y-3">
             <div className="bg-black/20 rounded-xl p-3.5 border border-white/5">
               <div className="flex items-center justify-between mb-1">
                 <div className="flex items-center space-x-2">
@@ -272,6 +368,7 @@ export const SyncView: React.FC<Props> = ({
                   <span className="font-medium text-sm text-white">Auto-Sync Playlist</span>
                 </div>
                 <button
+                  type="button"
                   onClick={() => setAutoSyncEnabled(!autoSyncEnabled)}
                   className={`w-11 h-6 rounded-full p-1 transition-colors duration-300 ease-in-out ${
                     autoSyncEnabled ? 'bg-green-500' : 'bg-gray-600'
@@ -285,8 +382,9 @@ export const SyncView: React.FC<Props> = ({
                 </button>
               </div>
               <p className="text-[11px] text-gray-400 leading-relaxed">
-                Persists sync state and track <code className="text-gray-300">transcodedSha256</code>{' '}
-                hashes in <code className="text-gray-300">data/state.json</code>.
+                Persists mapped <code className="text-gray-300">cardId</code> and track{' '}
+                <code className="text-gray-300">transcodedSha256</code> hashes in{' '}
+                <code className="text-gray-300">data/state.json</code>.
               </p>
             </div>
 
@@ -299,9 +397,8 @@ export const SyncView: React.FC<Props> = ({
 
             {!connected ? (
               <div className="bg-red-500/10 text-red-200 p-3 rounded-xl text-xs border border-red-500/20 text-center">
-                Disconnected: Configure <code>SPOTIPY_CLIENT_ID</code>,{' '}
-                <code>SPOTIPY_CLIENT_SECRET</code>, and <code>YOTO_ACCESS_TOKEN</code> in{' '}
-                <code>.env</code> to sync.
+                Disconnected: Connect both Spotify and Yoto via OAuth 2.0 PKCE in{' '}
+                <strong>Config</strong> before syncing.
               </div>
             ) : (
               <button
@@ -309,11 +406,15 @@ export const SyncView: React.FC<Props> = ({
                 disabled={syncing}
                 className="w-full bg-yoto-orange hover:bg-yoto-red disabled:opacity-50 text-white font-bold py-3.5 px-6 rounded-full shadow-lg transition-all flex items-center justify-center space-x-2 text-sm"
               >
-                <Link size={18} />
+                {isCreatingNew ? <PlusCircle size={18} /> : <Link size={18} />}
                 <span>
                   {syncing
-                    ? 'Running POST /api/sync...'
-                    : `Sync Playlist (${uncachedCount} uncached)`}
+                    ? isCreatingNew
+                      ? 'Creating New Yoto Playlist...'
+                      : 'Updating Yoto Playlist...'
+                    : isCreatingNew
+                    ? `Create & Sync Yoto Playlist (${uncachedCount} uncached)`
+                    : `Sync to ${targetSelection} (${uncachedCount} uncached)`}
                 </span>
               </button>
             )}

@@ -996,10 +996,12 @@ async function startServer() {
   app.post('/api/sync', async (req, res) => {
     const reqSpClientId = extractRequestSpotifyClientId(req);
     const reqYotoClientId = extractRequestYotoClientId(req);
-    const { playlistId, autoSync } = req.body as {
+    const { playlistId, autoSync, targetYotoId, createNew, customTitle } = req.body as {
       playlistId?: string;
       autoSync?: boolean;
       targetYotoId?: string;
+      createNew?: boolean;
+      customTitle?: string;
     };
 
     if (!playlistId) {
@@ -1033,25 +1035,118 @@ async function startServer() {
       return res.status(404).json({ detail: `Playlist ${playlistId} not found.` });
     }
 
-    const cardId = matched.syncConfig?.targetYotoId || `card-${playlistId}`;
+    const savedPl = state.playlists[playlistId];
+    const resolvedTargetCardId = createNew
+      ? undefined
+      : (targetYotoId && targetYotoId.trim()) ||
+        savedPl?.syncConfig?.targetYotoId ||
+        (state.settings.yotoCardId && state.settings.yotoCardId.trim()) ||
+        undefined;
+
+    const effectiveTitle = (customTitle || '').trim() || matched.name || 'Untitled Playlist';
+
+    // Build chapter tracks from any cached transcodedSha256 tracks in this playlist
+    const tracksList = Array.isArray(matched.tracks) ? matched.tracks : [];
+    const chapterTracks = tracksList
+      .filter((t: any) => t && t.transcodedSha256)
+      .map((t: any, idx: number) => ({
+        key: String(idx + 1).padStart(2, '0'),
+        title: t.title,
+        trackUrl: `yoto:#${t.transcodedSha256}`,
+        duration: t.durationSec || 180,
+        fileSize: t.fileSize || 0,
+        format: 'aac',
+        type: 'audio',
+        channels: 'stereo',
+      }));
+
+    // Build POST https://api.yotoplay.com/content payload (omit cardId when creating new)
+    const contentPayload: Record<string, any> = {
+      title: effectiveTitle,
+      metadata: {
+        description:
+          matched.description || `Synced by Yotofy from Spotify (${tracksList.length} tracks)`,
+      },
+      content: {
+        playbackType: 'linear',
+        chapters: [
+          {
+            key: '01',
+            title: effectiveTitle,
+            overlayLabel: '1',
+            tracks: chapterTracks,
+          },
+        ],
+      },
+    };
+    if (resolvedTargetCardId) {
+      contentPayload.cardId = resolvedTargetCardId;
+    }
+
+    let returnedCardId = resolvedTargetCardId || '';
+    try {
+      const yotoResp = await fetch(`${YOTO_API_BASE}/content`, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${yotoToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(contentPayload),
+      });
+
+      if (!yotoResp.ok) {
+        const errBody = await yotoResp.text();
+        addActivity(effectiveTitle, `Yoto POST /content failed (${yotoResp.status})`, 'error', errBody);
+        return res.status(yotoResp.status).json({
+          detail: `Yoto POST /content failed: ${errBody}`,
+        });
+      }
+
+      const cardResp = (await yotoResp.json()) as Record<string, any>;
+      returnedCardId = String(
+        cardResp.cardId || cardResp.card?.cardId || cardResp.id || resolvedTargetCardId || ''
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addActivity(effectiveTitle, `Yoto POST /content error: ${msg}`, 'error');
+      return res.status(502).json({ detail: `Yoto POST /content error: ${msg}` });
+    }
+
+    if (!returnedCardId) {
+      return res.status(502).json({
+        detail: 'Yoto POST /content succeeded, but no cardId was returned by Yoto.',
+      });
+    }
+
     state.playlists[playlistId] = {
       id: playlistId,
-      name: matched.name,
+      name: effectiveTitle,
       syncConfig: {
         enabled: Boolean(autoSync ?? true),
         lastCheck: new Date().toISOString(),
-        targetYotoId: cardId,
+        targetYotoId: returnedCardId,
       },
     };
     saveState(state);
-    addActivity(matched.name, `Synced playlist '${matched.name}' to Yoto Card ${cardId}`, 'success');
+
+    const actionVerb = resolvedTargetCardId ? 'Updated Yoto MYO Playlist' : 'Created new Yoto MYO Playlist';
+    addActivity(
+      effectiveTitle,
+      `${actionVerb} '${effectiveTitle}' -> cardId: ${returnedCardId}`,
+      'success'
+    );
+
+    const verification = await verifyYotoConnectionViaMine(reqYotoClientId);
 
     return res.json({
       status: 'synced',
+      cardId: returnedCardId,
       playlist: {
         ...matched,
         syncConfig: state.playlists[playlistId].syncConfig,
       },
+      yotoCards: verification.cards,
       activity: loadState().activity,
     });
   });

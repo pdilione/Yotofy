@@ -29,6 +29,7 @@ import {
   ListMusic,
   Database,
   Hash,
+  PlusCircle,
 } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -161,6 +162,17 @@ const App: React.FC = () => {
     setCurrentScreen('detail');
   };
 
+  const handleStartCreateNewYotoPlaylist = () => {
+    if (playlists.length > 0) {
+      // Clear default yotoCardId so SyncView defaults to '+ Create New Yoto Playlist'
+      setSettings((prev) => ({ ...prev, yotoCardId: '' }));
+      setSelectedPlaylistId(playlists[0].id);
+      setCurrentScreen('detail');
+    } else {
+      setDashboardView('spotify');
+    }
+  };
+
   const handleBack = () => {
     setSelectedPlaylistId(null);
     setCurrentScreen('dashboard');
@@ -168,11 +180,15 @@ const App: React.FC = () => {
 
   const handlePlaylistSynced = (
     updatedPlaylist: Playlist,
-    updatedActivity?: ActivityLog[]
+    updatedActivity?: ActivityLog[],
+    updatedYotoCards?: YotoMyoCard[]
   ) => {
     setPlaylists((prev) =>
       prev.map((p) => (p.id === updatedPlaylist.id ? updatedPlaylist : p))
     );
+    if (Array.isArray(updatedYotoCards)) {
+      setYotoCards(updatedYotoCards);
+    }
     if (updatedActivity) {
       setLogs(
         updatedActivity.map((item) => ({
@@ -263,6 +279,8 @@ const App: React.FC = () => {
                       <>
                         Monitoring <strong>{syncedPlaylists.length} playlists</strong> via
                         Spotipy and connected to <strong>{yotoCards.length} Yoto MYO cards</strong>.
+                        Click any Spotify playlist below to sync to an existing card or{' '}
+                        <strong className="text-yoto-orange">+ Create New Yoto Playlist</strong>.
                       </>
                     ) : (
                       <>
@@ -319,8 +337,8 @@ const App: React.FC = () => {
               </div>
 
               {/* Toggle View */}
-              <div className="flex items-center justify-between">
-                <div className="flex space-x-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex space-x-3">
                   <button
                     onClick={() => setDashboardView('spotify')}
                     className={`flex items-center space-x-2 px-4 py-2 rounded-full text-sm font-bold transition-colors ${
@@ -344,6 +362,16 @@ const App: React.FC = () => {
                     <span>My Yoto Cards ({totalYotoItemsCount})</span>
                   </button>
                 </div>
+
+                {playlists.length > 0 && (
+                  <button
+                    onClick={handleStartCreateNewYotoPlaylist}
+                    className="flex items-center space-x-1.5 px-4 py-2 rounded-full text-xs font-bold bg-yoto-orange hover:bg-orange-600 text-white shadow-lg shadow-orange-900/30 transition-all"
+                  >
+                    <PlusCircle size={15} />
+                    <span>+ Create New Yoto Playlist</span>
+                  </button>
+                )}
               </div>
 
               {/* Grid Content */}
@@ -369,8 +397,34 @@ const App: React.FC = () => {
                       </p>
                     </div>
                   )
-                ) : totalYotoItemsCount > 0 ? (
+                ) : (
                   <>
+                    {/* + Create New Yoto Playlist Card */}
+                    <div
+                      onClick={handleStartCreateNewYotoPlaylist}
+                      className="cursor-pointer group bg-yoto-orange/10 hover:bg-yoto-orange/20 rounded-2xl p-4 border-2 border-dashed border-yoto-orange/50 hover:border-yoto-orange transition-all hover:-translate-y-1 shadow-lg flex flex-col justify-between"
+                    >
+                      <div className="aspect-square mb-4 rounded-xl bg-black/40 flex flex-col items-center justify-center p-4 text-center">
+                        <PlusCircle size={40} className="text-yoto-orange mb-2 group-hover:scale-110 transition-transform" />
+                        <span className="text-xs font-bold text-white">
+                          + Create New Yoto Playlist
+                        </span>
+                        <span className="text-[11px] text-gray-400 mt-1">
+                          Sync a Spotify playlist into a brand-new MYO card
+                        </span>
+                      </div>
+                      <div>
+                        <h3 className="text-center font-bold text-yoto-orange text-sm truncate">
+                          + Create New Yoto Playlist
+                        </h3>
+                        <div className="flex items-center justify-center gap-1.5 mt-2">
+                          <span className="text-[10px] bg-yoto-orange/20 text-yoto-orange px-2 py-0.5 rounded-full font-mono">
+                            POST /content (new cardId)
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+
                     {syncedPlaylists.map((playlist) => {
                       const cachedInPl = playlist.tracks.filter(
                         (t) => t.inLocalCache && t.transcodedSha256
@@ -445,13 +499,6 @@ const App: React.FC = () => {
                       </div>
                     ))}
                   </>
-                ) : (
-                  <div className="col-span-full py-12 px-6 text-center bg-gray-900/50 rounded-2xl border border-white/5 text-gray-400">
-                    <p className="font-semibold text-white mb-1">No playlists synced yet</p>
-                    <p className="text-xs text-gray-500">
-                      Connect Yoto in Config or select a playlist from Spotify Sources to create a Yoto MYO card.
-                    </p>
-                  </div>
                 )}
               </div>
             </div>
@@ -546,6 +593,7 @@ const App: React.FC = () => {
             onPlaylistSynced={handlePlaylistSynced}
             connected={connections.yoto && connections.spotify}
             settings={settings}
+            yotoCards={yotoCards}
           />
         )}
 

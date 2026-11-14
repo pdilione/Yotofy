@@ -24,8 +24,10 @@ export interface SystemStatusResponse {
 
 export interface SyncResponse {
   status: 'synced' | 'error';
+  cardId?: string;
   playlist?: Playlist;
   yotoCard?: YotoCardConfig;
+  yotoCards?: YotoMyoCard[];
   activity?: ActivityLog[];
   message?: string;
 }
@@ -336,6 +338,8 @@ export const triggerSync = async (payload: {
   playlistId: string;
   autoSync?: boolean;
   targetYotoId?: string;
+  createNew?: boolean;
+  customTitle?: string;
 }): Promise<SyncResponse> => {
   const spotifyClientId = getStoredSpotifyClientId();
   const yotoClientId = getStoredYotoClientId();

@@ -1,0 +1,60 @@
+{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6Ik5FSkZSRGt3UkRrd05FSkROVUU0TnpoRk9UWkZRVEEzTkRReU56YzRSVVl6TmtZeE5qUTBOQSJ9.eyJpc3MiOiJodHRwczovL2xvZ2luLnlvdG9wbGF5LmNvbS8iLCJzdWIiOiJhdXRoMHw2NTg4NGE2YWZmMDJmZmNlZTk4N2I4NTciLCJhdWQiOiJodHRwczovL2FwaS55b3RvcGxheS5jb20iLCJpYXQiOjE3OTQ2OTYzMDQsImV4cCI6MTc5NDcxMDcwNCwic2NvcGUiOiJ1c2VyOmNvbnRlbnQ6bWFuYWdlIGZhbWlseTpsaWJyYXJ5Om1hbmFnZSIsImF6cCI6InRwY18zSDFUejdZVUNVc1FESDhWS0Rkc2lOIn0.Y23uuJ2v-k3S2sEirPYIMM-Ha0PmnXnCjtBxGAAhTiB3MGBxXgNJYHUuKH5CNuqJeEvTgqbhnodF2MqOBM7FnChwRb8NpYFwHcY9A2K4wQ_yN9pfa5ObzR_9N-mrHcmiMzlPBt4ZeKokyXlHvRTE9Erq4gzqjWWk3Sdd5jTdNdf1iSjS8AEB_Vmdudbso4LswH_zMoFEWC5FumYezI9z4FLsQZOrtLII7iXngqfOV0F70sPZzUX-UkdJWJDb1vhhVo3sfkth4rvae9722nlfLpAbNxB5HP2NLc7bRlb5v93pBYu4fCcXRE8QRQ9om1TeDTQk7Qxd8wjnghnIJMvFFQ",
+  "token_type": "Bearer",
+  "client_id": "tpc_3H1Tz7YUCUsQDH8VKDdsiN",
+  "pkce": true,
+  "scope": "user:content:manage family:library:manage",
+  "expires_in": 14400,
+  "expires_at": 1794710704,
+  "user": {
+    "id": "yoto-user",
+    "display_name": "Yoto Library (7 MYO Cards)",
+    "avatar": null,
+    "cardCount": 7
+  },
+  "cards": [
+    {
+      "cardId": "jhZpw",
+      "title": "Ailin Songs",
+      "coverImageUrl": "https://cdn.yoto.io/myo-cover/flower_orange.gif",
+      "updatedAt": "2025-08-02T23:29:41.930Z"
+    },
+    {
+      "cardId": "buNAh",
+      "title": "Emmie Songs",
+      "coverImageUrl": "https://cdn.yoto.io/myo-cover/bee_orange.gif",
+      "updatedAt": "2025-04-09T01:21:26.718Z"
+    },
+    {
+      "cardId": "fCzZ4",
+      "title": "Mystery Stories",
+      "coverImageUrl": "https://cdn.yoto.io/myo-cover/skull_green.gif",
+      "updatedAt": "2025-02-07T00:46:27.855Z"
+    },
+    {
+      "cardId": "67hUB",
+      "title": "Fairy Tales",
+      "coverImageUrl": "https://cdn.yoto.io/myo-cover/strawberry_yellow.gif",
+      "updatedAt": "2025-01-19T02:35:47.566Z"
+    },
+    {
+      "cardId": "bjbI0",
+      "title": "PJ Masks",
+      "coverImageUrl": "https://cdn.yoto.io/myo-cover/strawberry_grapefruit.gif",
+      "updatedAt": "2024-04-10T00:20:59.039Z"
+    },
+    {
+      "cardId": "elJNz",
+      "title": "Daddy Stories",
+      "description": "Books read by Daddy",
+      "coverImageUrl": "https://cdn.yoto.io/myo-cover/cloud_yellow.gif",
+      "updatedAt": "2024-03-08T16:45:18.607Z"
+    },
+    {
+      "cardId": "hgDvA",
+      "title": "Eric Carle",
+      "coverImageUrl": "https://cdn.yoto.io/myo-cover/bee_lilac.gif",
+      "updatedAt": "2024-01-24T01:48:37.397Z"
+    }
+  ]
+}

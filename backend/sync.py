@@ -758,6 +758,8 @@ class SyncRequest(BaseModel):
     playlistId: str
     autoSync: Optional[bool] = True
     targetYotoId: Optional[str] = None
+    createNew: Optional[bool] = False
+    customTitle: Optional[str] = None
     spotifyClientId: Optional[str] = None
     yotoClientId: Optional[str] = None
 
@@ -1348,55 +1350,71 @@ def api_sync(req: SyncRequest, request: Request):
 
     state = store.load()
     saved_pl = state.get("playlists", {}).get(req.playlistId, {})
-    target_card_id = (
-        req.targetYotoId
-        or (saved_pl.get("syncConfig") or {}).get("targetYotoId")
-        or state.get("settings", {}).get("yotoCardId")
-        or os.environ.get("YOTO_CARD_ID")
-        or None
-    )
+    if req.createNew:
+        target_card_id = None
+    else:
+        target_card_id = (
+            (req.targetYotoId.strip() if req.targetYotoId else None)
+            or (saved_pl.get("syncConfig") or {}).get("targetYotoId")
+            or state.get("settings", {}).get("yotoCardId")
+            or os.environ.get("YOTO_CARD_ID")
+            or None
+        )
+
+    effective_title = (req.customTitle or "").strip() or playlist_name
 
     try:
         card_resp = yoto.upsert_myo_content(
-            title=playlist_name,
+            title=effective_title,
             description=playlist_data.get("description", ""),
             tracks_payload=synced_tracks_for_card,
             card_id=target_card_id,
         )
     except Exception as exc:
-        store.add_activity(playlist_name, f"POST /content failed: {exc}", "error")
+        store.add_activity(effective_title, f"POST /content failed: {exc}", "error")
         raise HTTPException(status_code=502, detail=f"Yoto POST /content failed: {exc}")
 
     resolved_card_id = (
         card_resp.get("cardId")
         or (card_resp.get("card") or {}).get("cardId")
+        or card_resp.get("id")
         or target_card_id
-        or f"card-{req.playlistId}"
     )
+    if not resolved_card_id:
+        raise HTTPException(
+            status_code=502,
+            detail="Yoto POST /content succeeded but did not return a cardId.",
+        )
 
     state = store.load()
     sync_config = {
         "enabled": bool(req.autoSync),
         "lastCheck": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        "targetYotoId": resolved_card_id,
+        "targetYotoId": str(resolved_card_id),
     }
     state.setdefault("playlists", {})[req.playlistId] = {
         "id": req.playlistId,
-        "name": playlist_name,
+        "name": effective_title,
         "syncConfig": sync_config,
     }
     store.save(state)
 
+    action_label = "Created new Yoto MYO Playlist" if not target_card_id else "Updated Yoto MYO Playlist"
     store.add_activity(
-        playlist_name,
-        f"Synced {len(synced_tracks_for_card)} tracks to Yoto MYO Card ({resolved_card_id})",
+        effective_title,
+        f"{action_label} '{effective_title}' ({len(synced_tracks_for_card)} tracks) -> cardId: {resolved_card_id}",
         "success",
     )
 
+    _, _, refreshed_cards = verify_yoto_connection_via_mine(
+        extract_request_yoto_client_id(request, req.yotoClientId)
+    )
     updated_playlist = build_playlist_payload(raw_pl, sp, store.load())
     return {
         "status": "synced",
+        "cardId": str(resolved_card_id),
         "playlist": updated_playlist,
+        "yotoCards": refreshed_cards,
         "activity": store.load().get("activity", []),
     }
 
