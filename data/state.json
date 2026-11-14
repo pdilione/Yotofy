@@ -1,0 +1,16 @@
+{
+  "tracks": {},
+  "playlists": {},
+  "activity": [],
+  "settings": {
+    "audioProvider": "zotify",
+    "syncFrequency": "hourly",
+    "deploymentMode": "docker",
+    "autoConversion": true,
+    "notifications": true,
+    "githubUser": "",
+    "githubRepo": "yotofy",
+    "yotoCardId": "",
+    "spotifyClientId": ""
+  }
+}

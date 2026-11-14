@@ -3,8 +3,8 @@ set -eu
 
 mkdir -p /data /music
 
-# Start FastAPI backend on port 8000
-uvicorn backend.main:app \
+# Start FastAPI backend (backend/sync.py) on port 8000
+uvicorn backend.sync:app \
   --host 0.0.0.0 \
   --port "${API_PORT:-8000}" \
   --workers 1 \
@@ -23,7 +23,6 @@ cleanup() {
 
 trap cleanup INT TERM
 
-# Wait for either process to exit and propagate failure if one crashes
 while kill -0 "$API_PID" 2>/dev/null && kill -0 "$UI_PID" 2>/dev/null; do
   sleep 1
 done

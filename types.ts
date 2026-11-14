@@ -96,6 +96,14 @@ export interface AppSettings {
   githubUser: string;
   githubRepo: string;
   yotoCardId?: string;
+  spotifyClientId?: string;
+}
+
+export interface ConnectedUserProfile {
+  id?: string;
+  display_name: string;
+  avatar?: string | null;
+  email?: string;
 }
 
 export interface ActivityLog {

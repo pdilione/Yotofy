@@ -19,11 +19,6 @@ RUN npm run build
 # =============================================================================
 FROM python:3.11-slim AS runtime
 
-# Install system dependencies:
-# - ffmpeg: required by Zotify for 320kbps MP3 conversion
-# - git: required for pip installing librespot-python / zotify from git
-# - nginx: serves compiled Vite/React SPA on port 3000 & proxies /api/ to :8000
-# - curl: used for container healthchecks
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     git \
@@ -35,19 +30,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies
 COPY backend/requirements.txt ./backend/requirements.txt
 RUN pip install --no-cache-dir -r backend/requirements.txt
 
-# Copy Python backend, built Vite/React assets, and container configs
 COPY backend ./backend
 COPY --from=frontend-builder /app/dist ./dist
 COPY docker/nginx.conf /etc/nginx/conf.d/yotofy.conf
 COPY docker/entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh
 
-# Persistent directories for SQLite sync cache/credentials (/data) and MP3s (/music)
-RUN mkdir -p /data /music
+RUN mkdir -p /data /music && ln -sfn /data /app/data
 
 VOLUME ["/data", "/music"]
 
@@ -57,12 +49,10 @@ ENV PYTHONUNBUFFERED=1 \
     API_PORT=8000 \
     AUDIO_DIR=/music \
     DATA_DIR=/data \
-    CACHE_DB_PATH=/data/sync_cache.db \
-    CACHE_JSON_PATH=/data/sync_cache.json \
+    STATE_FILE_PATH=/data/state.json \
     ZOTIFY_CREDENTIALS_PATH=/data/credentials.json \
     FRONTEND_DIST_DIR=/app/dist
 
-# Expose 3000 for React UI and 8000 for FastAPI backend API
 EXPOSE 3000 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \

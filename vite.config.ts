@@ -8,11 +8,17 @@ export default defineConfig({
     host: '0.0.0.0',
     allowedHosts: true,
     hmr: false,
+    proxy: {
+      '/api': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+    },
   },
   plugins: [react()],
   resolve: {
     alias: {
       '@': path.resolve(__dirname, '.'),
-    }
-  }
+    },
+  },
 });

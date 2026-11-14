@@ -1,56 +1,146 @@
-import React, { useState } from 'react';
-import { MOCK_PLAYLISTS, MOCK_LOGS } from './services/mockData';
-import { Playlist, Track, ScreenState, AppSettings, ActivityLog } from './types';
+import React, { useState, useEffect, useCallback } from 'react';
+import {
+  Playlist,
+  ScreenState,
+  AppSettings,
+  ActivityLog,
+  ConnectedUserProfile,
+} from './types';
+import {
+  exchangeSpotifyPkceCode,
+  getStatus,
+  getPlaylists,
+  getActivity,
+  SPOTIFY_PKCE_RESULT_STORAGE_KEY,
+} from './services/api';
 import { PlaylistCard } from './components/PlaylistCard';
 import { SyncView } from './components/SyncView';
 import { SettingsView } from './components/SettingsView';
 import { ActivityFeed } from './components/ActivityFeed';
 import { YotoDisplay } from './components/YotoDisplay';
-import { Radio, Settings, Play, LayoutGrid, ListMusic, Database, DownloadCloud, Hash } from 'lucide-react';
-
-const makeSimulatedSha256 = (seed: string): string => {
-  const chars = '0123456789abcdef';
-  let out = '';
-  for (let i = 0; i < 64; i++) {
-    const code = (seed.charCodeAt(i % seed.length) * 19 + i * 29) % 16;
-    out += chars[code];
-  }
-  return out;
-};
+import {
+  Radio,
+  Settings,
+  RefreshCw,
+  LayoutGrid,
+  ListMusic,
+  Database,
+  Hash,
+} from 'lucide-react';
 
 const App: React.FC = () => {
   const [currentScreen, setCurrentScreen] = useState<ScreenState>('dashboard');
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
-  const [playlists, setPlaylists] = useState<Playlist[]>(MOCK_PLAYLISTS);
-  const [logs, setLogs] = useState<ActivityLog[]>(MOCK_LOGS);
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [logs, setLogs] = useState<ActivityLog[]>([]);
   const [dashboardView, setDashboardView] = useState<'spotify' | 'yoto'>('spotify');
-  const [activePipelineNotice, setActivePipelineNotice] = useState<string | null>(null);
+  const [loading, setLoading] = useState<boolean>(true);
+  const [cachedTracksCount, setCachedTracksCount] = useState<number>(0);
+  const [isOAuthPopupCallback, setIsOAuthPopupCallback] = useState<boolean>(false);
 
-  // App Level Settings (defaulting to Zotify librespot-python)
   const [settings, setSettings] = useState<AppSettings>({
     audioProvider: 'zotify',
     syncFrequency: 'hourly',
-    deploymentMode: 'browser',
+    deploymentMode: 'docker',
     autoConversion: true,
     notifications: true,
-    githubUser: 'your-username',
+    githubUser: '',
     githubRepo: 'yotofy',
+    yotoCardId: '',
+    spotifyClientId: '',
   });
 
-  // Connection State (both connected by default so user can immediately test Zotify + Yoto 4-step sync)
-  const [connections, setConnections] = useState({
-    spotify: true,
-    yoto: true,
+  const [connections, setConnections] = useState<{
+    spotify: boolean;
+    yoto: boolean;
+    spotifyUser: ConnectedUserProfile | null;
+    yotoUser: ConnectedUserProfile | null;
+  }>({
+    spotify: false,
+    yoto: false,
+    spotifyUser: null,
+    yotoUser: null,
   });
+
+  const loadBackendState = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [statusData, playlistsData, activityData] = await Promise.all([
+        getStatus().catch(() => ({
+          spotify: false,
+          yoto: false,
+          spotifyUser: null,
+          yotoUser: null,
+          cachedTracksCount: 0,
+          settings: undefined,
+        })),
+        getPlaylists().catch(() => []),
+        getActivity().catch(() => []),
+      ]);
+
+      setConnections({
+        spotify: Boolean(statusData.spotify),
+        yoto: Boolean(statusData.yoto),
+        spotifyUser: statusData.spotifyUser || null,
+        yotoUser: statusData.yotoUser || null,
+      });
+      setCachedTracksCount(statusData.cachedTracksCount || 0);
+      if (statusData.settings) {
+        setSettings(statusData.settings);
+      }
+      setPlaylists(playlistsData);
+      setLogs(activityData);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  // Handle Spotify OAuth 2.0 PKCE redirect landing on window.location.origin + '/'
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get('code');
+    const error = params.get('error');
+    const stateParam = params.get('state');
+
+    if ((code || error) && (!stateParam || stateParam === 'spotify_pkce')) {
+      // Clean URL query parameters
+      window.history.replaceState({}, document.title, window.location.pathname);
+
+      // If running inside the window.open popup, relay code to opener and close popup
+      if (window.opener && window.opener !== window) {
+        setIsOAuthPopupCallback(true);
+        try {
+          localStorage.setItem(
+            SPOTIFY_PKCE_RESULT_STORAGE_KEY,
+            JSON.stringify({ code, error, ts: Date.now() })
+          );
+          window.opener.postMessage(
+            { type: 'SPOTIFY_PKCE_CALLBACK', code, error },
+            window.location.origin
+          );
+        } catch {
+          // ignore cross-window errors
+        }
+        setTimeout(() => {
+          window.close();
+        }, 150);
+        return;
+      }
+
+      // If landed in the main window directly, exchange the PKCE code here
+      if (code) {
+        exchangeSpotifyPkceCode(code)
+          .then(() => loadBackendState())
+          .catch(() => loadBackendState());
+        return;
+      }
+    }
+
+    loadBackendState();
+  }, [loadBackendState]);
 
   const selectedPlaylist = playlists.find((p) => p.id === selectedPlaylistId) || null;
-
-  const totalTracksCount = playlists.reduce((acc, p) => acc + p.tracks.length, 0);
-  const totalCachedCount = playlists.reduce(
-    (acc, p) => acc + p.tracks.filter((t) => t.inLocalCache && t.transcodedSha256).length,
-    0
-  );
-  const totalUncachedCount = totalTracksCount - totalCachedCount;
+  const syncedPlaylists = playlists.filter((p) => p.syncConfig?.enabled);
 
   const handlePlaylistSelect = (playlist: Playlist) => {
     setSelectedPlaylistId(playlist.id);
@@ -62,216 +152,48 @@ const App: React.FC = () => {
     setCurrentScreen('dashboard');
   };
 
-  const addLog = (
-    playlistName: string,
-    message: string,
-    type: ActivityLog['type'],
-    details?: string
-  ) => {
-    const newLog: ActivityLog = {
-      id: Math.random().toString(36).substring(2, 11),
-      timestamp: new Date(),
-      playlistName,
-      message,
-      type,
-      details,
-    };
-    setLogs((prev) => [newLog, ...prev]);
-  };
-
-  const handleToggleSync = (
-    playlistId: string,
-    enabled: boolean,
-    updatedTracks?: Track[],
-    iconGrid?: string[],
-    themeColor?: string
+  const handlePlaylistSynced = (
+    updatedPlaylist: Playlist,
+    updatedActivity?: ActivityLog[]
   ) => {
     setPlaylists((prev) =>
-      prev.map((p) => {
-        if (p.id !== playlistId) return p;
-        const tracksToUse = updatedTracks || p.tracks;
-        return {
-          ...p,
-          tracks: tracksToUse,
-          trackCount: tracksToUse.length,
-          generatedIcon: iconGrid || p.generatedIcon,
-          themeColor: themeColor || p.themeColor,
-          syncConfig: enabled
-            ? {
-                enabled: true,
-                lastCheck: 'Just now',
-                targetYotoId: p.syncConfig?.targetYotoId || `card-${playlistId}`,
-              }
-            : undefined,
-        };
-      })
+      prev.map((p) => (p.id === updatedPlaylist.id ? updatedPlaylist : p))
     );
-  };
-
-  const toggleConnection = (service: 'spotify' | 'yoto') => {
-    setConnections((prev) => {
-      const nextState = !prev[service];
-      addLog(
-        'System',
-        `${service === 'spotify' ? 'Spotify (Spotipy/Zotify)' : 'Yoto Developer API'} ${
-          nextState ? 'connected' : 'disconnected'
-        }`,
-        'info'
+    if (updatedActivity) {
+      setLogs(
+        updatedActivity.map((item) => ({
+          ...item,
+          timestamp: item.timestamp ? new Date(item.timestamp) : new Date(),
+        }))
       );
-      return { ...prev, [service]: nextState };
-    });
+    } else {
+      getActivity()
+        .then(setLogs)
+        .catch(() => {});
+    }
   };
 
   const handleSaveSettings = (newSettings: AppSettings) => {
     setSettings(newSettings);
     setCurrentScreen('dashboard');
-    addLog('System', 'Configuration updated', 'info');
+    loadBackendState();
   };
 
-  // Real-time simulation of a new Spotify track going through Zotify + Yoto 4-step API + SQLite/JSON cache
-  const simulateSpotifyUpdate = () => {
-    if (!connections.spotify) {
-      addLog('System', 'Connect Spotify first!', 'warning');
-      return;
-    }
-    if (!connections.yoto) {
-      addLog('System', 'Connect Yoto Developer API first!', 'warning');
-      return;
-    }
-
-    const syncedPlaylists = playlists.filter((p) => p.syncConfig?.enabled);
-    if (syncedPlaylists.length === 0) {
-      addLog('System', 'Enable Auto-Sync on at least one playlist first.', 'warning');
-      return;
-    }
-
-    const target = syncedPlaylists[Math.floor(Math.random() * syncedPlaylists.length)];
-    const trackNum = target.tracks.length + 1;
-    const newTrackId = `${target.id}-sp-${Date.now().toString(36).slice(-4)}`;
-    const newSongTitle = `Spotify Track #${trackNum}`;
-    const cardId = target.syncConfig?.targetYotoId || `card-${target.id}`;
-    const cachedBefore = target.tracks.filter((t) => t.inLocalCache && t.transcodedSha256).length;
-
-    const pendingTrack: Track = {
-      id: newTrackId,
-      title: newSongTitle,
-      artist: 'Spotify Artist',
-      album: target.name,
-      duration: '3:18',
-      imageUrl: `https://picsum.photos/seed/${newTrackId}/64/64`,
-      inLocalCache: false,
-      zotifyStatus: 'downloading',
-      yotoTranscodeStatus: 'idle',
-    };
-
-    // 1. Add uncached track to playlist & log Spotipy detection
-    setPlaylists((prev) =>
-      prev.map((p) =>
-        p.id === target.id
-          ? { ...p, tracks: [pendingTrack, ...p.tracks], trackCount: p.tracks.length + 1 }
-          : p
-      )
+  if (isOAuthPopupCallback) {
+    return (
+      <div className="min-h-screen bg-spotify-black text-white flex items-center justify-center p-6">
+        <div className="bg-gray-900 border border-white/10 rounded-2xl p-8 text-center max-w-sm space-y-3">
+          <div className="w-10 h-10 rounded-full bg-spotify-green/20 text-spotify-green flex items-center justify-center mx-auto">
+            <Radio size={20} />
+          </div>
+          <h2 className="text-lg font-bold">Spotify Authorization Complete</h2>
+          <p className="text-xs text-gray-400">
+            Completing PKCE token exchange with Yotofy. This window will close automatically.
+          </p>
+        </div>
+      </div>
     );
-    setActivePipelineNotice(
-      `Spotipy detected "${newSongTitle}" in ${target.name} (${cachedBefore} cached, 1 uncached)`
-    );
-    addLog(
-      target.name,
-      `Spotipy: New track "${newSongTitle}" detected (Cache miss in sync_cache.db)`,
-      'info',
-      `${cachedBefore} existing tracks skipped via local SHA-256 cache`
-    );
-
-    // 2. Zotify (librespot-python) 320kbps MP3 download
-    setTimeout(() => {
-      setActivePipelineNotice(`Zotify (librespot): Downloading "${newSongTitle}" as 320kbps MP3...`);
-      addLog(
-        target.name,
-        `Zotify (librespot-python): Downloaded "${newSongTitle}" (320kbps MP3)`,
-        'download',
-        `Saved to public/audio/${newTrackId}.mp3`
-      );
-
-      setPlaylists((prev) =>
-        prev.map((p) =>
-          p.id === target.id
-            ? {
-                ...p,
-                tracks: p.tracks.map((t) =>
-                  t.id === newTrackId
-                    ? { ...t, zotifyStatus: 'downloaded', yotoTranscodeStatus: 'uploading' }
-                    : t
-                ),
-              }
-            : p
-        )
-      );
-
-      // 3. Yoto API Steps 1-3: /uploadUrl -> PUT audio -> Poll /transcoded for transcodedSha256
-      setTimeout(() => {
-        const uploadId = `upl_${newTrackId}`;
-        setActivePipelineNotice(
-          `Yoto API: PUT audio to /uploadUrl & polling /media/upload/${uploadId}/transcoded...`
-        );
-        addLog(
-          target.name,
-          `Yoto API Steps 1-3: Uploaded MP3 & polling transcode (${uploadId})`,
-          'info',
-          `GET /media/transcode/audio/uploadUrl -> PUT audio/mpeg -> Poll /transcoded`
-        );
-
-        setPlaylists((prev) =>
-          prev.map((p) =>
-            p.id === target.id
-              ? {
-                  ...p,
-                  tracks: p.tracks.map((t) =>
-                    t.id === newTrackId ? { ...t, yotoTranscodeStatus: 'transcoding' } : t
-                  ),
-                }
-              : p
-          )
-        );
-
-        // 4. Yoto API Step 4: Save transcodedSha256 to cache & POST /content
-        setTimeout(() => {
-          const sha256 = makeSimulatedSha256(newTrackId);
-          setPlaylists((prev) =>
-            prev.map((p) =>
-              p.id === target.id
-                ? {
-                    ...p,
-                    syncConfig: p.syncConfig
-                      ? { ...p.syncConfig, lastCheck: 'Just now' }
-                      : undefined,
-                    tracks: p.tracks.map((t) =>
-                      t.id === newTrackId
-                        ? {
-                            ...t,
-                            inLocalCache: true,
-                            zotifyStatus: 'cached',
-                            yotoTranscodeStatus: 'transcoded',
-                            transcodedSha256: sha256,
-                            syncedAt: 'Just now',
-                          }
-                        : t
-                    ),
-                  }
-                : p
-            )
-          );
-
-          addLog(
-            target.name,
-            `Step 4 POST /content: Updated MYO Card ${cardId}`,
-            'success',
-            `Cached ${newTrackId} -> yoto:#${sha256.slice(0, 16)}... in sync_cache.db`
-          );
-          setActivePipelineNotice(null);
-        }, 1100);
-      }, 900);
-    }, 800);
-  };
+  }
 
   return (
     <div className="min-h-screen bg-spotify-black text-white flex flex-col font-sans selection:bg-yoto-orange selection:text-white">
@@ -285,13 +207,13 @@ const App: React.FC = () => {
         </div>
 
         <div className="flex items-center space-x-6 text-sm font-medium text-gray-400">
-          {/* Simulation Button */}
           <button
-            onClick={simulateSpotifyUpdate}
-            className="hidden md:flex items-center space-x-2 bg-white/5 hover:bg-white/10 text-spotify-green px-3 py-1.5 rounded-full border border-spotify-green/20 transition-all hover:border-spotify-green/50"
+            onClick={loadBackendState}
+            disabled={loading}
+            className="flex items-center space-x-2 bg-white/5 hover:bg-white/10 text-gray-200 px-3 py-1.5 rounded-full border border-white/10 transition-all disabled:opacity-50"
           >
-            <Play size={14} className="fill-current" />
-            <span>Simulate New Spotify Track</span>
+            <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+            <span>Refresh</span>
           </button>
 
           <div className="w-px h-4 bg-gray-700 hidden md:block"></div>
@@ -305,40 +227,35 @@ const App: React.FC = () => {
             <Settings size={16} />
             <span>Config</span>
           </button>
-
-          <div className="w-8 h-8 bg-purple-600 rounded-full flex items-center justify-center text-xs font-bold text-white cursor-pointer hover:ring-2 ring-white/20">
-            JD
-          </div>
         </div>
       </header>
 
       {/* Main Content */}
       <main className="flex-1 p-6 max-w-7xl mx-auto w-full">
-        {/* Live Pipeline Banner when simulating or syncing */}
-        {activePipelineNotice && (
-          <div className="mb-6 bg-yoto-orange/15 border border-yoto-orange/40 text-yoto-orange px-4 py-3 rounded-xl flex items-center justify-between text-xs font-medium animate-pulse">
-            <div className="flex items-center space-x-2">
-              <DownloadCloud size={16} />
-              <span>{activePipelineNotice}</span>
-            </div>
-            <span className="font-mono text-[11px] text-white/80">Zotify &rarr; Yoto 4-Step API</span>
-          </div>
-        )}
-
         {currentScreen === 'dashboard' && (
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 animate-fade-in-up">
             {/* Left Column: Main Dashboard */}
             <div className="lg:col-span-2 space-y-8">
-              {/* Welcome/Status Widget */}
+              {/* Status Widget */}
               <div className="relative rounded-2xl overflow-hidden bg-gradient-to-r from-spotify-green/20 to-yoto-orange/20 p-8 border border-white/5">
                 <div className="relative z-10">
-                  <h2 className="text-3xl font-extrabold mb-2">System Active.</h2>
-                  <p className="text-gray-300 text-lg mb-4 max-w-xl">
-                    Monitoring{' '}
-                    <strong>{playlists.filter((p) => p.syncConfig?.enabled).length} playlists</strong>{' '}
-                    via Spotipy. Uncached tracks are pulled as 320kbps MP3s with{' '}
-                    <strong>Zotify</strong> and uploaded via the{' '}
-                    <strong>Yoto 4-Step MYO API</strong>.
+                  <h2 className="text-3xl font-extrabold mb-2">
+                    {connections.spotify && connections.yoto
+                      ? 'System Active.'
+                      : 'Disconnected'}
+                  </h2>
+                  <p className="text-gray-300 text-sm md:text-base mb-4 max-w-xl">
+                    {connections.spotify && connections.yoto ? (
+                      <>
+                        Monitoring <strong>{syncedPlaylists.length} playlists</strong> via
+                        Spotipy and syncing to Yoto MYO cards.
+                      </>
+                    ) : (
+                      <>
+                        Open <strong>Config</strong> to paste your Spotify Client ID and
+                        connect via OAuth 2.0 PKCE.
+                      </>
+                    )}
                   </p>
                   <div className="flex flex-wrap items-center gap-3">
                     <div
@@ -353,7 +270,12 @@ const App: React.FC = () => {
                           connections.spotify ? 'bg-green-500' : 'bg-red-500'
                         }`}
                       />
-                      <span>Spotipy + Zotify (librespot)</span>
+                      <span>
+                        Spotify:{' '}
+                        {connections.spotify
+                          ? connections.spotifyUser?.display_name || 'Connected'
+                          : 'Disconnected'}
+                      </span>
                     </div>
                     <div
                       className={`flex items-center space-x-2 text-xs px-3 py-1.5 rounded-full border ${
@@ -367,20 +289,17 @@ const App: React.FC = () => {
                           connections.yoto ? 'bg-yoto-orange' : 'bg-red-500'
                         }`}
                       />
-                      <span>Yoto Developer API (/content)</span>
+                      <span>
+                        Yoto:{' '}
+                        {connections.yoto
+                          ? connections.yotoUser?.display_name || 'Connected'
+                          : 'Disconnected'}
+                      </span>
                     </div>
                     <div className="flex items-center space-x-1.5 text-xs px-3 py-1.5 rounded-full border bg-emerald-500/10 border-emerald-500/30 text-emerald-300">
                       <Database size={12} />
-                      <span>
-                        {totalCachedCount}/{totalTracksCount} Cached (transcodedSha256)
-                      </span>
+                      <span>{cachedTracksCount} Cached in data/state.json</span>
                     </div>
-                    {totalUncachedCount > 0 && (
-                      <div className="flex items-center space-x-1.5 text-xs px-3 py-1.5 rounded-full border bg-amber-500/10 border-amber-500/30 text-amber-300">
-                        <DownloadCloud size={12} />
-                        <span>{totalUncachedCount} Need Spotify Pull</span>
-                      </div>
-                    )}
                   </div>
                 </div>
               </div>
@@ -397,7 +316,7 @@ const App: React.FC = () => {
                     }`}
                   >
                     <ListMusic size={16} />
-                    <span>Spotify Sources</span>
+                    <span>Spotify Sources ({playlists.length})</span>
                   </button>
                   <button
                     onClick={() => setDashboardView('yoto')}
@@ -408,148 +327,152 @@ const App: React.FC = () => {
                     }`}
                   >
                     <LayoutGrid size={16} />
-                    <span>My Yoto Cards</span>
+                    <span>My Yoto Cards ({syncedPlaylists.length})</span>
                   </button>
                 </div>
               </div>
 
               {/* Grid Content */}
-              <div className="grid grid-cols-2 md:grid-cols-3 gap-6">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6">
                 {dashboardView === 'spotify' ? (
-                  <>
-                    {playlists.map((playlist) => (
+                  playlists.length > 0 ? (
+                    playlists.map((playlist) => (
                       <PlaylistCard
                         key={playlist.id}
                         playlist={playlist}
                         onClick={handlePlaylistSelect}
                       />
-                    ))}
-                    <div className="border-2 border-dashed border-gray-700 rounded-xl flex flex-col items-center justify-center p-6 text-gray-500 hover:border-gray-500 hover:text-gray-300 transition-all cursor-pointer min-h-[250px] group">
-                      <div className="w-12 h-12 rounded-full bg-gray-800 flex items-center justify-center mb-2 group-hover:scale-110 transition-transform">
-                        <span className="text-2xl">+</span>
-                      </div>
-                      <span className="font-medium">Add Source</span>
+                    ))
+                  ) : (
+                    <div className="col-span-full py-12 px-6 text-center bg-gray-900/50 rounded-2xl border border-white/5 text-gray-400">
+                      <p className="font-semibold text-white mb-1">
+                        No playlists synced yet
+                      </p>
+                      <p className="text-xs text-gray-500">
+                        {connections.spotify
+                          ? 'No playlists found in your connected Spotify account.'
+                          : 'Disconnected — connect your Spotify account in Config.'}
+                      </p>
                     </div>
-                  </>
-                ) : (
-                  <>
-                    {playlists
-                      .filter((p) => p.syncConfig?.enabled)
-                      .map((playlist) => {
-                        const cachedInPl = playlist.tracks.filter(
-                          (t) => t.inLocalCache && t.transcodedSha256
-                        ).length;
-                        return (
-                          <div
-                            key={playlist.id}
-                            onClick={() => handlePlaylistSelect(playlist)}
-                            className="cursor-pointer group"
-                          >
-                            <div className="bg-gray-800 rounded-2xl p-4 border border-white/5 hover:border-yoto-orange/50 transition-all hover:-translate-y-1 shadow-lg">
-                              <div className="aspect-square mb-4">
-                                <YotoDisplay
-                                  iconGrid={
-                                    playlist.generatedIcon || new Array(256).fill('#000')
-                                  }
-                                  themeColor={playlist.themeColor || '#333'}
-                                  isSyncing={false}
-                                />
-                              </div>
-                              <h3 className="text-center font-bold text-white text-sm truncate">
-                                {playlist.name}
-                              </h3>
-                              <div className="flex items-center justify-center gap-1.5 mt-2">
-                                <span className="text-[10px] bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full">
-                                  MYO Active
-                                </span>
-                                <span className="text-[10px] bg-white/10 text-gray-300 px-2 py-0.5 rounded-full font-mono flex items-center gap-0.5">
-                                  <Hash size={9} />
-                                  {cachedInPl}/{playlist.tracks.length}
-                                </span>
-                              </div>
-                            </div>
+                  )
+                ) : syncedPlaylists.length > 0 ? (
+                  syncedPlaylists.map((playlist) => {
+                    const cachedInPl = playlist.tracks.filter(
+                      (t) => t.inLocalCache && t.transcodedSha256
+                    ).length;
+                    return (
+                      <div
+                        key={playlist.id}
+                        onClick={() => handlePlaylistSelect(playlist)}
+                        className="cursor-pointer group"
+                      >
+                        <div className="bg-gray-800 rounded-2xl p-4 border border-white/5 hover:border-yoto-orange/50 transition-all hover:-translate-y-1 shadow-lg">
+                          <div className="aspect-square mb-4">
+                            <YotoDisplay
+                              iconGrid={
+                                playlist.generatedIcon || new Array(256).fill('#000000')
+                              }
+                              themeColor={playlist.themeColor || '#FF6D00'}
+                              isSyncing={false}
+                            />
                           </div>
-                        );
-                      })}
-                    {playlists.filter((p) => p.syncConfig?.enabled).length === 0 && (
-                      <div className="col-span-full py-12 text-center text-gray-500">
-                        <p>
-                          No synced cards yet. Go to "Spotify Sources" and enable sync on a
-                          playlist.
-                        </p>
+                          <h3 className="text-center font-bold text-white text-sm truncate">
+                            {playlist.name}
+                          </h3>
+                          <div className="flex items-center justify-center gap-1.5 mt-2">
+                            <span className="text-[10px] bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full">
+                              MYO Active
+                            </span>
+                            <span className="text-[10px] bg-white/10 text-gray-300 px-2 py-0.5 rounded-full font-mono flex items-center gap-0.5">
+                              <Hash size={9} />
+                              {cachedInPl}/{playlist.tracks.length}
+                            </span>
+                          </div>
+                        </div>
                       </div>
-                    )}
-                  </>
+                    );
+                  })
+                ) : (
+                  <div className="col-span-full py-12 px-6 text-center bg-gray-900/50 rounded-2xl border border-white/5 text-gray-400">
+                    <p className="font-semibold text-white mb-1">No playlists synced yet</p>
+                    <p className="text-xs text-gray-500">
+                      Select a playlist from Spotify Sources and run sync to create a Yoto MYO card.
+                    </p>
+                  </div>
                 )}
               </div>
             </div>
 
             {/* Right Column: Sidebar */}
             <div className="space-y-6">
-              {/* Quick Connect & Local Cache Summary Panel */}
+              {/* Services Connection Status */}
               <div className="bg-gray-900 rounded-2xl p-6 border border-white/10 space-y-4">
                 <div className="flex justify-between items-center">
                   <h3 className="text-sm font-bold text-gray-400 uppercase tracking-wider">
-                    Services &amp; Cache
+                    Services
                   </h3>
+                  <button
+                    onClick={() => setCurrentScreen('settings')}
+                    className="text-xs text-spotify-green hover:underline"
+                  >
+                    Manage OAuth
+                  </button>
                 </div>
                 <div className="space-y-3">
-                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg hover:bg-white/10 transition-colors">
-                    <div>
-                      <span className="font-medium text-sm block">Spotify + Zotify</span>
-                      <span className="text-[11px] text-gray-400">
-                        Spotipy API &amp; librespot 320kbps
-                      </span>
+                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+                    <div className="flex items-center space-x-2.5 min-w-0">
+                      {connections.spotifyUser?.avatar && (
+                        <img
+                          src={connections.spotifyUser.avatar}
+                          alt={connections.spotifyUser.display_name}
+                          className="w-7 h-7 rounded-full object-cover"
+                        />
+                      )}
+                      <div className="min-w-0">
+                        <span className="font-medium text-sm block truncate">
+                          {connections.spotifyUser?.display_name || 'Spotify (Spotipy)'}
+                        </span>
+                        <span className="text-[11px] text-gray-500 block truncate">
+                          {connections.spotify ? 'OAuth 2.0 PKCE' : 'OAuth 2.0 PKCE'}
+                        </span>
+                      </div>
                     </div>
-                    <button
-                      onClick={() => toggleConnection('spotify')}
+                    <span
                       className={`text-xs font-semibold px-2.5 py-1 rounded-full ${
                         connections.spotify
                           ? 'bg-green-500/15 text-green-400'
-                          : 'bg-white/5 text-gray-500'
+                          : 'bg-red-500/10 text-gray-400'
                       }`}
                     >
                       {connections.spotify ? 'Connected' : 'Disconnected'}
-                    </button>
+                    </span>
                   </div>
-                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg hover:bg-white/10 transition-colors">
-                    <div>
-                      <span className="font-medium text-sm block">Yoto Developer API</span>
-                      <span className="text-[11px] text-gray-400">
-                        4-Step /uploadUrl &rarr; /content
-                      </span>
+                  <div className="flex items-center justify-between p-3 bg-white/5 rounded-lg">
+                    <div className="flex items-center space-x-2.5 min-w-0">
+                      {connections.yotoUser?.avatar && (
+                        <img
+                          src={connections.yotoUser.avatar}
+                          alt={connections.yotoUser.display_name}
+                          className="w-7 h-7 rounded-full object-cover"
+                        />
+                      )}
+                      <div className="min-w-0">
+                        <span className="font-medium text-sm block truncate">
+                          {connections.yotoUser?.display_name || 'Yoto Developer API'}
+                        </span>
+                        <span className="text-[11px] text-gray-500 block truncate">
+                          {connections.yoto ? 'OAuth Connected' : 'OAuth SSO'}
+                        </span>
+                      </div>
                     </div>
-                    <button
-                      onClick={() => toggleConnection('yoto')}
+                    <span
                       className={`text-xs font-semibold px-2.5 py-1 rounded-full ${
                         connections.yoto
                           ? 'bg-yoto-orange/15 text-yoto-orange'
-                          : 'bg-white/5 text-gray-500'
+                          : 'bg-red-500/10 text-gray-400'
                       }`}
                     >
                       {connections.yoto ? 'Connected' : 'Disconnected'}
-                    </button>
-                  </div>
-                </div>
-
-                {/* Local Cache Breakdown */}
-                <div className="pt-2 border-t border-white/10 text-xs space-y-2">
-                  <div className="flex items-center justify-between text-gray-400">
-                    <span className="flex items-center gap-1.5">
-                      <Database size={13} className="text-emerald-400" />
-                      Cached in <code className="text-gray-300">sync_cache.db</code>
-                    </span>
-                    <span className="font-mono text-emerald-400 font-bold">
-                      {totalCachedCount} tracks
-                    </span>
-                  </div>
-                  <div className="flex items-center justify-between text-gray-400">
-                    <span className="flex items-center gap-1.5">
-                      <DownloadCloud size={13} className="text-amber-400" />
-                      Pending Spotify Zotify Pull
-                    </span>
-                    <span className="font-mono text-amber-300 font-bold">
-                      {totalUncachedCount} tracks
                     </span>
                   </div>
                 </div>
@@ -557,7 +480,7 @@ const App: React.FC = () => {
 
               {/* Activity Feed */}
               <div className="h-[500px]">
-                <ActivityFeed logs={logs} />
+                <ActivityFeed logs={logs} onLogsLoaded={setLogs} />
               </div>
             </div>
           </div>
@@ -567,8 +490,7 @@ const App: React.FC = () => {
           <SyncView
             playlist={selectedPlaylist}
             onBack={handleBack}
-            onToggleSync={handleToggleSync}
-            onLog={addLog}
+            onPlaylistSynced={handlePlaylistSynced}
             connected={connections.yoto && connections.spotify}
             settings={settings}
           />
@@ -579,6 +501,7 @@ const App: React.FC = () => {
             settings={settings}
             onSave={handleSaveSettings}
             onBack={handleBack}
+            onSpotifyConnected={loadBackendState}
           />
         )}
       </main>

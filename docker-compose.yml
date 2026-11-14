@@ -8,7 +8,7 @@ services:
     restart: unless-stopped
     ports:
       - "${UI_PORT:-3000}:3000"   # Vite/React UI (proxies /api/* to FastAPI)
-      - "${API_PORT:-8000}:8000" # FastAPI Python Backend API & OpenAPI docs (/docs)
+      - "${API_PORT:-8000}:8000" # FastAPI Python Backend API (backend/sync.py)
     env_file:
       - path: .env
         required: false
@@ -17,19 +17,18 @@ services:
       - API_PORT=8000
       - AUDIO_DIR=/music
       - DATA_DIR=/data
-      - CACHE_DB_PATH=/data/sync_cache.db
-      - CACHE_JSON_PATH=/data/sync_cache.json
+      - STATE_FILE_PATH=/data/state.json
       - ZOTIFY_CREDENTIALS_PATH=/data/credentials.json
       - FRONTEND_DIST_DIR=/app/dist
-      - SPOTIFY_CLIENT_ID=${SPOTIFY_CLIENT_ID:-}
-      - SPOTIFY_CLIENT_SECRET=${SPOTIFY_CLIENT_SECRET:-}
-      - SPOTIFY_PLAYLIST_ID=${SPOTIFY_PLAYLIST_ID:-}
+      - SPOTIPY_CLIENT_ID=${SPOTIPY_CLIENT_ID:-}
+      - SPOTIPY_CLIENT_SECRET=${SPOTIPY_CLIENT_SECRET:-}
+      - SPOTIPY_USER_ID=${SPOTIPY_USER_ID:-}
+      - SPOTIPY_PLAYLIST_IDS=${SPOTIPY_PLAYLIST_IDS:-}
       - ZOTIFY_CREDENTIALS_JSON=${ZOTIFY_CREDENTIALS_JSON:-}
       - YOTO_ACCESS_TOKEN=${YOTO_ACCESS_TOKEN:-}
       - YOTO_CARD_ID=${YOTO_CARD_ID:-}
-      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
     volumes:
-      # Persistent SQLite sync cache (sync_cache.db / sync_cache.json) and credentials.json
+      # Persistent sync history/state (state.json) and Zotify credentials
       - ./data:/data
       # Persistent local MP3 music library downloaded via Zotify
       - ./music:/music
