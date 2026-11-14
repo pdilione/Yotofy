@@ -5,13 +5,16 @@ import {
   AppSettings,
   ActivityLog,
   ConnectedUserProfile,
+  YotoMyoCard,
 } from './types';
 import {
   exchangeSpotifyPkceCode,
+  exchangeYotoPkceCode,
   getStatus,
   getPlaylists,
   getActivity,
   SPOTIFY_PKCE_RESULT_STORAGE_KEY,
+  YOTO_PKCE_RESULT_STORAGE_KEY,
 } from './services/api';
 import { PlaylistCard } from './components/PlaylistCard';
 import { SyncView } from './components/SyncView';
@@ -32,6 +35,7 @@ const App: React.FC = () => {
   const [currentScreen, setCurrentScreen] = useState<ScreenState>('dashboard');
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [yotoCards, setYotoCards] = useState<YotoMyoCard[]>([]);
   const [logs, setLogs] = useState<ActivityLog[]>([]);
   const [dashboardView, setDashboardView] = useState<'spotify' | 'yoto'>('spotify');
   const [loading, setLoading] = useState<boolean>(true);
@@ -48,6 +52,7 @@ const App: React.FC = () => {
     githubRepo: 'yotofy',
     yotoCardId: '',
     spotifyClientId: '',
+    yotoClientId: '',
   });
 
   const [connections, setConnections] = useState<{
@@ -71,6 +76,7 @@ const App: React.FC = () => {
           yoto: false,
           spotifyUser: null,
           yotoUser: null,
+          yotoCards: [],
           cachedTracksCount: 0,
           settings: undefined,
         })),
@@ -84,6 +90,7 @@ const App: React.FC = () => {
         spotifyUser: statusData.spotifyUser || null,
         yotoUser: statusData.yotoUser || null,
       });
+      setYotoCards(Array.isArray(statusData.yotoCards) ? statusData.yotoCards : []);
       setCachedTracksCount(statusData.cachedTracksCount || 0);
       if (statusData.settings) {
         setSettings(statusData.settings);
@@ -95,27 +102,31 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Handle Spotify OAuth 2.0 PKCE redirect landing on window.location.origin + '/'
+  // Handle Spotify & Yoto OAuth 2.0 PKCE redirects landing on window.location.origin + '/'
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
     const code = params.get('code');
     const error = params.get('error');
     const stateParam = params.get('state');
 
-    if ((code || error) && (!stateParam || stateParam === 'spotify_pkce')) {
-      // Clean URL query parameters
+    if (code || error) {
+      const isYoto = stateParam === 'yoto_pkce';
+      const callbackType = isYoto ? 'YOTO_PKCE_CALLBACK' : 'SPOTIFY_PKCE_CALLBACK';
+      const storageKey = isYoto
+        ? YOTO_PKCE_RESULT_STORAGE_KEY
+        : SPOTIFY_PKCE_RESULT_STORAGE_KEY;
+
       window.history.replaceState({}, document.title, window.location.pathname);
 
-      // If running inside the window.open popup, relay code to opener and close popup
       if (window.opener && window.opener !== window) {
         setIsOAuthPopupCallback(true);
         try {
           localStorage.setItem(
-            SPOTIFY_PKCE_RESULT_STORAGE_KEY,
+            storageKey,
             JSON.stringify({ code, error, ts: Date.now() })
           );
           window.opener.postMessage(
-            { type: 'SPOTIFY_PKCE_CALLBACK', code, error },
+            { type: callbackType, code, error },
             window.location.origin
           );
         } catch {
@@ -127,9 +138,11 @@ const App: React.FC = () => {
         return;
       }
 
-      // If landed in the main window directly, exchange the PKCE code here
       if (code) {
-        exchangeSpotifyPkceCode(code)
+        const exchangePromise = isYoto
+          ? exchangeYotoPkceCode(code)
+          : exchangeSpotifyPkceCode(code);
+        exchangePromise
           .then(() => loadBackendState())
           .catch(() => loadBackendState());
         return;
@@ -141,6 +154,7 @@ const App: React.FC = () => {
 
   const selectedPlaylist = playlists.find((p) => p.id === selectedPlaylistId) || null;
   const syncedPlaylists = playlists.filter((p) => p.syncConfig?.enabled);
+  const totalYotoItemsCount = syncedPlaylists.length + yotoCards.length;
 
   const handlePlaylistSelect = (playlist: Playlist) => {
     setSelectedPlaylistId(playlist.id);
@@ -186,7 +200,7 @@ const App: React.FC = () => {
           <div className="w-10 h-10 rounded-full bg-spotify-green/20 text-spotify-green flex items-center justify-center mx-auto">
             <Radio size={20} />
           </div>
-          <h2 className="text-lg font-bold">Spotify Authorization Complete</h2>
+          <h2 className="text-lg font-bold">OAuth Authorization Complete</h2>
           <p className="text-xs text-gray-400">
             Completing PKCE token exchange with Yotofy. This window will close automatically.
           </p>
@@ -248,12 +262,12 @@ const App: React.FC = () => {
                     {connections.spotify && connections.yoto ? (
                       <>
                         Monitoring <strong>{syncedPlaylists.length} playlists</strong> via
-                        Spotipy and syncing to Yoto MYO cards.
+                        Spotipy and connected to <strong>{yotoCards.length} Yoto MYO cards</strong>.
                       </>
                     ) : (
                       <>
-                        Open <strong>Config</strong> to paste your Spotify Client ID and
-                        connect via OAuth 2.0 PKCE.
+                        Open <strong>Config</strong> to paste your Spotify and Yoto Client IDs
+                        and connect via OAuth 2.0 PKCE.
                       </>
                     )}
                   </p>
@@ -327,7 +341,7 @@ const App: React.FC = () => {
                     }`}
                   >
                     <LayoutGrid size={16} />
-                    <span>My Yoto Cards ({syncedPlaylists.length})</span>
+                    <span>My Yoto Cards ({totalYotoItemsCount})</span>
                   </button>
                 </div>
               </div>
@@ -355,48 +369,87 @@ const App: React.FC = () => {
                       </p>
                     </div>
                   )
-                ) : syncedPlaylists.length > 0 ? (
-                  syncedPlaylists.map((playlist) => {
-                    const cachedInPl = playlist.tracks.filter(
-                      (t) => t.inLocalCache && t.transcodedSha256
-                    ).length;
-                    return (
+                ) : totalYotoItemsCount > 0 ? (
+                  <>
+                    {syncedPlaylists.map((playlist) => {
+                      const cachedInPl = playlist.tracks.filter(
+                        (t) => t.inLocalCache && t.transcodedSha256
+                      ).length;
+                      return (
+                        <div
+                          key={playlist.id}
+                          onClick={() => handlePlaylistSelect(playlist)}
+                          className="cursor-pointer group"
+                        >
+                          <div className="bg-gray-800 rounded-2xl p-4 border border-white/5 hover:border-yoto-orange/50 transition-all hover:-translate-y-1 shadow-lg">
+                            <div className="aspect-square mb-4">
+                              <YotoDisplay
+                                iconGrid={
+                                  playlist.generatedIcon || new Array(256).fill('#000000')
+                                }
+                                themeColor={playlist.themeColor || '#FF6D00'}
+                                isSyncing={false}
+                              />
+                            </div>
+                            <h3 className="text-center font-bold text-white text-sm truncate">
+                              {playlist.name}
+                            </h3>
+                            <div className="flex items-center justify-center gap-1.5 mt-2">
+                              <span className="text-[10px] bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full">
+                                MYO Synced
+                              </span>
+                              <span className="text-[10px] bg-white/10 text-gray-300 px-2 py-0.5 rounded-full font-mono flex items-center gap-0.5">
+                                <Hash size={9} />
+                                {cachedInPl}/{playlist.tracks.length}
+                              </span>
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                    {yotoCards.map((card) => (
                       <div
-                        key={playlist.id}
-                        onClick={() => handlePlaylistSelect(playlist)}
-                        className="cursor-pointer group"
+                        key={card.cardId}
+                        className="bg-gray-800 rounded-2xl p-4 border border-white/5 hover:border-yoto-orange/50 transition-all shadow-lg flex flex-col justify-between"
                       >
-                        <div className="bg-gray-800 rounded-2xl p-4 border border-white/5 hover:border-yoto-orange/50 transition-all hover:-translate-y-1 shadow-lg">
-                          <div className="aspect-square mb-4">
+                        <div className="aspect-square mb-4 rounded-xl overflow-hidden bg-black/40 flex items-center justify-center">
+                          {card.coverImageUrl ? (
+                            <img
+                              src={card.coverImageUrl}
+                              alt={card.title}
+                              className="w-full h-full object-cover"
+                            />
+                          ) : (
                             <YotoDisplay
-                              iconGrid={
-                                playlist.generatedIcon || new Array(256).fill('#000000')
-                              }
-                              themeColor={playlist.themeColor || '#FF6D00'}
+                              iconGrid={new Array(256).fill('#000000')}
+                              themeColor="#FF6D00"
                               isSyncing={false}
                             />
-                          </div>
+                          )}
+                        </div>
+                        <div>
                           <h3 className="text-center font-bold text-white text-sm truncate">
-                            {playlist.name}
+                            {card.title}
                           </h3>
                           <div className="flex items-center justify-center gap-1.5 mt-2">
-                            <span className="text-[10px] bg-green-500/20 text-green-400 px-2 py-0.5 rounded-full">
-                              MYO Active
+                            <span className="text-[10px] bg-yoto-orange/20 text-yoto-orange px-2 py-0.5 rounded-full font-mono">
+                              {card.cardId}
                             </span>
-                            <span className="text-[10px] bg-white/10 text-gray-300 px-2 py-0.5 rounded-full font-mono flex items-center gap-0.5">
-                              <Hash size={9} />
-                              {cachedInPl}/{playlist.tracks.length}
-                            </span>
+                            {card.trackCount ? (
+                              <span className="text-[10px] bg-white/10 text-gray-300 px-2 py-0.5 rounded-full">
+                                {card.trackCount} tracks
+                              </span>
+                            ) : null}
                           </div>
                         </div>
                       </div>
-                    );
-                  })
+                    ))}
+                  </>
                 ) : (
                   <div className="col-span-full py-12 px-6 text-center bg-gray-900/50 rounded-2xl border border-white/5 text-gray-400">
                     <p className="font-semibold text-white mb-1">No playlists synced yet</p>
                     <p className="text-xs text-gray-500">
-                      Select a playlist from Spotify Sources and run sync to create a Yoto MYO card.
+                      Connect Yoto in Config or select a playlist from Spotify Sources to create a Yoto MYO card.
                     </p>
                   </div>
                 )}
@@ -433,7 +486,7 @@ const App: React.FC = () => {
                           {connections.spotifyUser?.display_name || 'Spotify (Spotipy)'}
                         </span>
                         <span className="text-[11px] text-gray-500 block truncate">
-                          {connections.spotify ? 'OAuth 2.0 PKCE' : 'OAuth 2.0 PKCE'}
+                          OAuth 2.0 PKCE
                         </span>
                       </div>
                     </div>
@@ -461,7 +514,7 @@ const App: React.FC = () => {
                           {connections.yotoUser?.display_name || 'Yoto Developer API'}
                         </span>
                         <span className="text-[11px] text-gray-500 block truncate">
-                          {connections.yoto ? 'OAuth Connected' : 'OAuth SSO'}
+                          OAuth 2.0 PKCE (/content/mine)
                         </span>
                       </div>
                     </div>

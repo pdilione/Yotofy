@@ -1,4 +1,11 @@
-import { Playlist, ActivityLog, AppSettings, YotoCardConfig, ConnectedUserProfile } from '../types';
+import {
+  Playlist,
+  ActivityLog,
+  AppSettings,
+  YotoCardConfig,
+  ConnectedUserProfile,
+  YotoMyoCard,
+} from '../types';
 
 export interface SystemStatusResponse {
   spotify: boolean;
@@ -6,8 +13,10 @@ export interface SystemStatusResponse {
   spotifyConfigured?: boolean;
   yotoConfigured?: boolean;
   spotifyClientId?: string;
+  yotoClientId?: string;
   spotifyUser?: ConnectedUserProfile | null;
   yotoUser?: ConnectedUserProfile | null;
+  yotoCards?: YotoMyoCard[];
   cachedTracksCount?: number;
   settings?: AppSettings;
   message?: string;
@@ -29,7 +38,16 @@ export const SPOTIFY_PKCE_VERIFIER_STORAGE_KEY = 'yotofy_spotify_pkce_verifier';
 export const SPOTIFY_PKCE_REDIRECT_STORAGE_KEY = 'yotofy_spotify_pkce_redirect';
 export const SPOTIFY_PKCE_RESULT_STORAGE_KEY = 'yotofy_spotify_pkce_result';
 
+export const YOTO_CLIENT_ID_STORAGE_KEY = 'yotofy_yoto_client_id';
+export const YOTO_PKCE_VERIFIER_STORAGE_KEY = 'yotofy_yoto_pkce_verifier';
+export const YOTO_PKCE_REDIRECT_STORAGE_KEY = 'yotofy_yoto_pkce_redirect';
+export const YOTO_PKCE_RESULT_STORAGE_KEY = 'yotofy_yoto_pkce_result';
+
 export const SPOTIFY_SCOPES = 'playlist-read-private playlist-read-collaborative';
+export const YOTO_SCOPES = 'user:content:manage family:library:manage';
+export const YOTO_AUDIENCE = 'https://api.yotoplay.com';
+export const YOTO_AUTHORIZE_ENDPOINT = 'https://login.yotoplay.com/authorize';
+export const YOTO_TOKEN_ENDPOINT = 'https://login.yotoplay.com/oauth/token';
 
 export const getStoredSpotifyClientId = (): string => {
   if (typeof window === 'undefined') return '';
@@ -46,6 +64,21 @@ export const setStoredSpotifyClientId = (clientId: string): void => {
   }
 };
 
+export const getStoredYotoClientId = (): string => {
+  if (typeof window === 'undefined') return '';
+  return (localStorage.getItem(YOTO_CLIENT_ID_STORAGE_KEY) || '').trim();
+};
+
+export const setStoredYotoClientId = (clientId: string): void => {
+  if (typeof window === 'undefined') return;
+  const trimmed = clientId.trim();
+  if (trimmed) {
+    localStorage.setItem(YOTO_CLIENT_ID_STORAGE_KEY, trimmed);
+  } else {
+    localStorage.removeItem(YOTO_CLIENT_ID_STORAGE_KEY);
+  }
+};
+
 export const getSpotifyRedirectUri = (): string => {
   if (typeof window === 'undefined') return 'http://127.0.0.1:8000/';
   return `${window.location.origin}/`;
@@ -56,15 +89,19 @@ function buildApiHeaders(extra: Record<string, string> = {}): Record<string, str
     Accept: 'application/json',
     ...extra,
   };
-  const clientId = getStoredSpotifyClientId();
-  if (clientId) {
-    headers['X-Spotify-Client-Id'] = clientId;
+  const spClientId = getStoredSpotifyClientId();
+  if (spClientId) {
+    headers['X-Spotify-Client-Id'] = spClientId;
+  }
+  const yotoClientId = getStoredYotoClientId();
+  if (yotoClientId) {
+    headers['X-Yoto-Client-Id'] = yotoClientId;
   }
   return headers;
 }
 
 // ============================================================================
-// OAuth 2.0 PKCE Browser Helpers for Spotify
+// OAuth 2.0 PKCE Browser Helpers for Spotify & Yoto
 // ============================================================================
 function generateCodeVerifier(length = 64): string {
   const charset = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~';
@@ -171,6 +208,88 @@ export const exchangeSpotifyPkceCode = async (
   return data;
 };
 
+export const openYotoPkcePopup = async (clientIdInput?: string): Promise<Window | null> => {
+  const clientId = (clientIdInput ?? getStoredYotoClientId()).trim();
+  if (!clientId) {
+    throw new Error('Please paste your Yoto Client ID first.');
+  }
+
+  setStoredYotoClientId(clientId);
+
+  const codeVerifier = generateCodeVerifier(64);
+  const codeChallenge = await generateCodeChallenge(codeVerifier);
+  const redirectUri = getSpotifyRedirectUri();
+
+  localStorage.setItem(YOTO_PKCE_VERIFIER_STORAGE_KEY, codeVerifier);
+  localStorage.setItem(YOTO_PKCE_REDIRECT_STORAGE_KEY, redirectUri);
+  localStorage.removeItem(YOTO_PKCE_RESULT_STORAGE_KEY);
+
+  const params = new URLSearchParams({
+    client_id: clientId,
+    response_type: 'code',
+    redirect_uri: redirectUri,
+    audience: YOTO_AUDIENCE,
+    scope: YOTO_SCOPES,
+    code_challenge_method: 'S256',
+    code_challenge: codeChallenge,
+    state: 'yoto_pkce',
+  });
+
+  const authorizeUrl = `${YOTO_AUTHORIZE_ENDPOINT}?${params.toString()}`;
+  const width = 520;
+  const height = 720;
+  const left = Math.max(0, Math.round(window.screenX + (window.outerWidth - width) / 2));
+  const top = Math.max(0, Math.round(window.screenY + (window.outerHeight - height) / 2));
+
+  return window.open(
+    authorizeUrl,
+    'YotoPKCEAuth',
+    `width=${width},height=${height},left=${left},top=${top},menubar=no,toolbar=no,location=yes,status=no`
+  );
+};
+
+export const exchangeYotoPkceCode = async (
+  code: string,
+  clientIdOverride?: string
+): Promise<{
+  status: string;
+  yotoUser?: ConnectedUserProfile | null;
+  yotoCards?: YotoMyoCard[];
+}> => {
+  const clientId = (clientIdOverride || getStoredYotoClientId()).trim();
+  const codeVerifier = localStorage.getItem(YOTO_PKCE_VERIFIER_STORAGE_KEY) || '';
+  const redirectUri =
+    localStorage.getItem(YOTO_PKCE_REDIRECT_STORAGE_KEY) || getSpotifyRedirectUri();
+
+  if (!clientId) {
+    throw new Error('Missing Yoto Client ID for PKCE token exchange.');
+  }
+  if (!codeVerifier) {
+    throw new Error('Missing Yoto PKCE code_verifier in localStorage. Please try connecting again.');
+  }
+
+  const response = await fetch('/api/auth/yoto/pkce', {
+    method: 'POST',
+    headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({
+      code,
+      codeVerifier,
+      redirectUri,
+      clientId,
+    }),
+  });
+
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      data.detail || data.error || data.message || `Yoto PKCE exchange failed (${response.status})`
+    );
+  }
+
+  localStorage.removeItem(YOTO_PKCE_VERIFIER_STORAGE_KEY);
+  return data;
+};
+
 // ============================================================================
 // REST API Calls
 // ============================================================================
@@ -219,12 +338,14 @@ export const triggerSync = async (payload: {
   targetYotoId?: string;
 }): Promise<SyncResponse> => {
   const spotifyClientId = getStoredSpotifyClientId();
+  const yotoClientId = getStoredYotoClientId();
   const response = await fetch('/api/sync', {
     method: 'POST',
     headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({
       ...payload,
       ...(spotifyClientId ? { spotifyClientId } : {}),
+      ...(yotoClientId ? { yotoClientId } : {}),
     }),
   });
   const data = await response.json().catch(() => ({}));
@@ -236,8 +357,12 @@ export const triggerSync = async (payload: {
 
 export const saveSettings = async (settings: AppSettings): Promise<AppSettings> => {
   const spotifyClientId = settings.spotifyClientId ?? getStoredSpotifyClientId();
+  const yotoClientId = settings.yotoClientId ?? getStoredYotoClientId();
   if (spotifyClientId) {
     setStoredSpotifyClientId(spotifyClientId);
+  }
+  if (yotoClientId) {
+    setStoredYotoClientId(yotoClientId);
   }
   const response = await fetch('/api/settings', {
     method: 'POST',
@@ -245,6 +370,7 @@ export const saveSettings = async (settings: AppSettings): Promise<AppSettings> 
     body: JSON.stringify({
       ...settings,
       spotifyClientId,
+      yotoClientId,
     }),
   });
   if (!response.ok) {

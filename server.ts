@@ -18,6 +18,7 @@ const DEFAULT_SPOTIFY_REDIRECT_URI = 'http://127.0.0.1:8000/api/auth/spotify/cal
 const DEFAULT_YOTO_REDIRECT_URI = 'http://127.0.0.1:8000/api/auth/yoto/callback';
 const YOTO_AUTH_BASE = (process.env.YOTO_AUTH_BASE_URL || 'https://login.yotoplay.com').replace(/\/+$/, '');
 const YOTO_API_BASE = 'https://api.yotoplay.com';
+const YOTO_PKCE_SCOPES = 'user:content:manage family:library:manage';
 
 // Load .env if present
 const envPath = path.resolve(__dirname, '.env');
@@ -77,6 +78,7 @@ interface PersistedState {
     githubRepo: string;
     yotoCardId?: string;
     spotifyClientId?: string;
+    yotoClientId?: string;
   };
 }
 
@@ -84,6 +86,16 @@ interface ConnectedUserProfile {
   id?: string;
   display_name: string;
   avatar?: string | null;
+  cardCount?: number;
+}
+
+interface YotoMyoCard {
+  cardId: string;
+  title: string;
+  description?: string;
+  coverImageUrl?: string;
+  trackCount?: number;
+  updatedAt?: string;
 }
 
 const DEFAULT_SETTINGS = {
@@ -96,6 +108,7 @@ const DEFAULT_SETTINGS = {
   githubRepo: 'yotofy',
   yotoCardId: process.env.YOTO_CARD_ID || '',
   spotifyClientId: process.env.SPOTIPY_CLIENT_ID || process.env.SPOTIFY_CLIENT_ID || '',
+  yotoClientId: process.env.YOTO_CLIENT_ID || '',
 };
 
 function loadState(): PersistedState {
@@ -187,27 +200,43 @@ function getSpotifyConfig(reqClientId?: string) {
   return { clientId, clientSecret, redirectUri };
 }
 
+function getYotoConfig(reqClientId?: string) {
+  const state = loadState();
+  const tokenData = loadJsonFile<Record<string, any>>(YOTO_TOKEN_FILE);
+  const clientId = (
+    reqClientId ||
+    state.settings?.yotoClientId ||
+    tokenData?.client_id ||
+    process.env.YOTO_CLIENT_ID ||
+    ''
+  ).trim();
+  const clientSecret = (process.env.YOTO_CLIENT_SECRET || '').trim();
+  const redirectUri = (process.env.YOTO_REDIRECT_URI || DEFAULT_YOTO_REDIRECT_URI).trim();
+  return { clientId, clientSecret, redirectUri };
+}
+
 function extractRequestSpotifyClientId(req: express.Request): string {
   const headerVal = req.headers['x-spotify-client-id'];
   if (typeof headerVal === 'string' && headerVal.trim()) {
     return headerVal.trim();
   }
-  const bodyVal = req.body?.clientId || req.body?.spotifyClientId;
+  const bodyVal = req.body?.spotifyClientId;
   if (typeof bodyVal === 'string' && bodyVal.trim()) {
     return bodyVal.trim();
-  }
-  const queryVal = req.query?.client_id;
-  if (typeof queryVal === 'string' && queryVal.trim()) {
-    return queryVal.trim();
   }
   return '';
 }
 
-function getYotoConfig() {
-  const clientId = (process.env.YOTO_CLIENT_ID || '').trim();
-  const clientSecret = (process.env.YOTO_CLIENT_SECRET || '').trim();
-  const redirectUri = (process.env.YOTO_REDIRECT_URI || DEFAULT_YOTO_REDIRECT_URI).trim();
-  return { clientId, clientSecret, redirectUri };
+function extractRequestYotoClientId(req: express.Request): string {
+  const headerVal = req.headers['x-yoto-client-id'];
+  if (typeof headerVal === 'string' && headerVal.trim()) {
+    return headerVal.trim();
+  }
+  const bodyVal = req.body?.yotoClientId;
+  if (typeof bodyVal === 'string' && bodyVal.trim()) {
+    return bodyVal.trim();
+  }
+  return '';
 }
 
 function getFrontendRedirectUrl(querySuffix = ''): string {
@@ -286,13 +315,13 @@ async function getSpotifyUserProfile(reqClientId?: string): Promise<ConnectedUse
   }
 }
 
-async function getYotoAccessToken(): Promise<string | null> {
+async function getYotoAccessToken(reqClientId?: string): Promise<string | null> {
   const tokenData = loadJsonFile<Record<string, any>>(YOTO_TOKEN_FILE);
   if (tokenData && tokenData.access_token) {
     const expiresAt = Number(tokenData.expires_at || 0);
     const nowSec = Math.floor(Date.now() / 1000);
     if (expiresAt && nowSec >= expiresAt - 60 && tokenData.refresh_token) {
-      const { clientId, clientSecret } = getYotoConfig();
+      const { clientId, clientSecret } = getYotoConfig(reqClientId || tokenData.client_id);
       if (clientId) {
         try {
           const payload: Record<string, string> = {
@@ -300,7 +329,9 @@ async function getYotoAccessToken(): Promise<string | null> {
             client_id: clientId,
             refresh_token: String(tokenData.refresh_token),
           };
-          if (clientSecret) payload.client_secret = clientSecret;
+          if (clientSecret && !tokenData.pkce) {
+            payload.client_secret = clientSecret;
+          }
           const resp = await fetch(`${YOTO_AUTH_BASE}/oauth/token`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
@@ -311,6 +342,7 @@ async function getYotoAccessToken(): Promise<string | null> {
             const merged: Record<string, any> = {
               ...tokenData,
               ...refreshed,
+              client_id: clientId,
               refresh_token: refreshed.refresh_token || tokenData.refresh_token,
               expires_at: Math.floor(Date.now() / 1000) + Number(refreshed.expires_in || 3600),
             };
@@ -329,55 +361,114 @@ async function getYotoAccessToken(): Promise<string | null> {
   return envToken.length > 8 ? envToken : null;
 }
 
-async function getYotoUserProfile(): Promise<ConnectedUserProfile | null> {
-  const tokenData = loadJsonFile<Record<string, any>>(YOTO_TOKEN_FILE);
-  const token = await getYotoAccessToken();
-  if (!token) return null;
+function parseYotoMineCards(raw: Record<string, any>): YotoMyoCard[] {
+  const rawList = Array.isArray(raw)
+    ? raw
+    : Array.isArray(raw.cards)
+    ? raw.cards
+    : Array.isArray(raw.content)
+    ? raw.content
+    : [];
 
-  if (tokenData?.user?.display_name) {
-    return {
-      id: tokenData.user.id,
-      display_name: tokenData.user.display_name,
-      avatar: tokenData.user.avatar || null,
-    };
-  }
-
-  for (const endpoint of [`${YOTO_AUTH_BASE}/userinfo`, `${YOTO_API_BASE}/user/profile`]) {
-    try {
-      const resp = await fetch(endpoint, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (resp.ok) {
-        const data = (await resp.json()) as Record<string, any>;
-        const userObj = (data.user && typeof data.user === 'object' ? data.user : data) as Record<string, any>;
-        const displayName =
-          userObj.name ||
-          userObj.display_name ||
-          userObj.nickname ||
-          userObj.email ||
-          userObj.sub ||
-          'Yoto Account';
-        const avatar = userObj.picture || userObj.avatar || userObj.icon || null;
-        const profile: ConnectedUserProfile = {
-          id: userObj.sub || userObj.id || 'yoto-user',
-          display_name: String(displayName),
-          avatar,
-        };
-        if (tokenData) {
-          saveJsonFile(YOTO_TOKEN_FILE, { ...tokenData, user: profile });
+  return rawList
+    .filter((item: any) => item && (item.cardId || item.id || item._id))
+    .map((item: Record<string, any>) => {
+      const cardId = String(item.cardId || item.id || item._id);
+      const metadata = (item.metadata || {}) as Record<string, any>;
+      const content = (item.content || {}) as Record<string, any>;
+      const chapters = Array.isArray(content.chapters) ? content.chapters : [];
+      let trackCount = 0;
+      for (const ch of chapters) {
+        if (Array.isArray(ch?.tracks)) {
+          trackCount += ch.tracks.length;
         }
-        return profile;
       }
-    } catch {
-      // continue to next endpoint
-    }
+      const cover =
+        metadata.cover?.imageL ||
+        metadata.cover?.imageM ||
+        metadata.cover?.imageS ||
+        item.coverImageUrl ||
+        undefined;
+      return {
+        cardId,
+        title: String(item.title || metadata.title || `MYO Card ${cardId}`),
+        description: metadata.description ? String(metadata.description) : undefined,
+        coverImageUrl: cover,
+        trackCount: trackCount || chapters.length || undefined,
+        updatedAt: item.updatedAt ? String(item.updatedAt) : undefined,
+      };
+    });
+}
+
+async function verifyYotoConnectionViaMine(reqClientId?: string): Promise<{
+  verified: boolean;
+  profile: ConnectedUserProfile | null;
+  cards: YotoMyoCard[];
+}> {
+  const token = await getYotoAccessToken(reqClientId);
+  if (!token) {
+    return { verified: false, profile: null, cards: [] };
   }
 
-  return {
-    id: 'yoto-user',
-    display_name: 'Yoto Account',
-    avatar: null,
-  };
+  const tokenData = loadJsonFile<Record<string, any>>(YOTO_TOKEN_FILE) || {};
+
+  try {
+    const mineResp = await fetch(`${YOTO_API_BASE}/content/mine`, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: 'application/json',
+      },
+    });
+
+    if (!mineResp.ok) {
+      return { verified: false, profile: null, cards: [] };
+    }
+
+    const mineJson = (await mineResp.json()) as Record<string, any>;
+    const cards = parseYotoMineCards(mineJson);
+
+    let displayName = tokenData.user?.display_name || '';
+    let avatar: string | null = tokenData.user?.avatar || null;
+    let userId = tokenData.user?.id || 'yoto-user';
+
+    if (!displayName || displayName === 'Yoto Account') {
+      try {
+        const userResp = await fetch(`${YOTO_AUTH_BASE}/userinfo`, {
+          headers: { Authorization: `Bearer ${token}` },
+        });
+        if (userResp.ok) {
+          const u = (await userResp.json()) as Record<string, any>;
+          displayName =
+            u.name || u.nickname || u.preferred_username || u.email || u.sub || '';
+          avatar = u.picture || u.avatar || null;
+          userId = u.sub || u.id || userId;
+        }
+      } catch {
+        // ignore optional userinfo lookup error
+      }
+    }
+
+    const profile: ConnectedUserProfile = {
+      id: userId,
+      display_name: displayName || `Yoto Library (${cards.length} MYO Cards)`,
+      avatar,
+      cardCount: cards.length,
+    };
+
+    if (fs.existsSync(YOTO_TOKEN_FILE)) {
+      saveJsonFile(YOTO_TOKEN_FILE, {
+        ...tokenData,
+        user: profile,
+        cards,
+      });
+    }
+
+    return { verified: true, profile, cards };
+  } catch (err) {
+    console.error('Failed to verify Yoto connection via /content/mine:', err);
+    return { verified: false, profile: null, cards: [] };
+  }
 }
 
 function formatDurationMs(ms: number): string {
@@ -507,7 +598,7 @@ async function startServer() {
   // Spotify OAuth 2.0 PKCE & Standard OAuth Routes
   // =========================================================================
   app.post('/api/auth/spotify/pkce', async (req, res) => {
-    const reqClientId = extractRequestSpotifyClientId(req);
+    const reqClientId = extractRequestSpotifyClientId(req) || String(req.body?.clientId || '').trim();
     const { code, codeVerifier, redirectUri } = req.body as {
       code?: string;
       codeVerifier?: string;
@@ -527,7 +618,6 @@ async function startServer() {
       });
     }
 
-    // Persist clientId into state.json so subsequent calls work automatically
     const state = loadState();
     state.settings = { ...state.settings, spotifyClientId: clientId };
     saveState(state);
@@ -654,64 +744,123 @@ async function startServer() {
   });
 
   // =========================================================================
-  // Yoto Browser OAuth / Device Code Routes
+  // Yoto OAuth 2.0 PKCE & Standard OAuth Routes
   // =========================================================================
-  app.get('/api/auth/yoto/login', async (req, res) => {
-    const flow = String(req.query.flow || 'code');
-    const { clientId, redirectUri } = getYotoConfig();
+  app.post('/api/auth/yoto/pkce', async (req, res) => {
+    const reqClientId = extractRequestYotoClientId(req) || String(req.body?.clientId || '').trim();
+    const { code, codeVerifier, redirectUri } = req.body as {
+      code?: string;
+      codeVerifier?: string;
+      redirectUri?: string;
+      clientId?: string;
+    };
+    const { clientId } = getYotoConfig(reqClientId);
+
     if (!clientId) {
       return res.status(400).json({
-        detail: 'YOTO_CLIENT_ID must be set in .env before starting Yoto OAuth login.',
+        detail: 'Yoto Client ID is required for PKCE authentication.',
+      });
+    }
+    if (!code || !codeVerifier || !redirectUri) {
+      return res.status(400).json({
+        detail: 'Missing code, codeVerifier, or redirectUri for Yoto PKCE token exchange.',
       });
     }
 
-    if (flow === 'device') {
-      try {
-        const body = new URLSearchParams({
-          client_id: clientId,
-          scope: 'openid profile email offline_access',
-          audience: YOTO_API_BASE,
-        });
-        const deviceResp = await fetch(`${YOTO_AUTH_BASE}/oauth/device/code`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: body.toString(),
-        });
-        if (deviceResp.ok) {
-          const deviceData = (await deviceResp.json()) as Record<string, any>;
-          saveJsonFile(YOTO_TOKEN_FILE, {
-            device_code: deviceData.device_code,
-            user_code: deviceData.user_code,
-            verification_uri: deviceData.verification_uri,
-            verification_uri_complete: deviceData.verification_uri_complete,
-            interval: deviceData.interval || 5,
-            created_at: Math.floor(Date.now() / 1000),
-          });
-          const targetUrl =
-            deviceData.verification_uri_complete || deviceData.verification_uri;
-          if (targetUrl) {
-            return res.redirect(String(targetUrl));
-          }
-        }
-      } catch (err) {
-        console.error('Yoto device code initiation failed, falling back to authorization code flow:', err);
+    const state = loadState();
+    state.settings = { ...state.settings, yotoClientId: clientId };
+    saveState(state);
+
+    try {
+      const body = new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: clientId,
+        code,
+        redirect_uri: redirectUri,
+        code_verifier: codeVerifier,
+      });
+
+      const tokenResp = await fetch(`${YOTO_AUTH_BASE}/oauth/token`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+      });
+
+      if (!tokenResp.ok) {
+        const errText = await tokenResp.text();
+        addActivity('Yoto Auth', 'Yoto PKCE token exchange failed', 'error', errText);
+        return res.status(400).json({ detail: `Yoto PKCE token exchange failed: ${errText}` });
       }
+
+      const tokenData = (await tokenResp.json()) as Record<string, any>;
+      const existing = loadJsonFile<Record<string, any>>(YOTO_TOKEN_FILE) || {};
+      const storedPayload = {
+        access_token: tokenData.access_token,
+        refresh_token: tokenData.refresh_token || existing.refresh_token,
+        token_type: tokenData.token_type || 'Bearer',
+        client_id: clientId,
+        pkce: true,
+        scope: tokenData.scope || YOTO_PKCE_SCOPES,
+        expires_in: Number(tokenData.expires_in || 3600),
+        expires_at: Math.floor(Date.now() / 1000) + Number(tokenData.expires_in || 3600),
+      };
+      saveJsonFile(YOTO_TOKEN_FILE, storedPayload);
+
+      // Verify connection by calling GET https://api.yotoplay.com/content/mine
+      const verification = await verifyYotoConnectionViaMine(clientId);
+      if (!verification.verified) {
+        addActivity(
+          'Yoto Auth',
+          'Yoto token exchanged, but GET /content/mine verification failed',
+          'warning'
+        );
+        return res.status(400).json({
+          detail: 'Yoto token obtained, but GET https://api.yotoplay.com/content/mine failed verification.',
+        });
+      }
+
+      const displayName = verification.profile?.display_name || 'Yoto Account';
+      addActivity(
+        'Yoto Auth',
+        `Verified Yoto connection via /content/mine (${verification.cards.length} MYO cards)`,
+        'success',
+        displayName
+      );
+
+      return res.json({
+        status: 'ok',
+        yotoUser: verification.profile,
+        yotoCards: verification.cards,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      addActivity('Yoto Auth', `Yoto PKCE exchange failed: ${msg}`, 'error');
+      return res.status(400).json({ detail: `Yoto PKCE exchange failed: ${msg}` });
+    }
+  });
+
+  app.get('/api/auth/yoto/login', async (req, res) => {
+    const reqClientId = extractRequestYotoClientId(req);
+    const { clientId, redirectUri } = getYotoConfig(reqClientId);
+    if (!clientId) {
+      return res.status(400).json({
+        detail: 'Paste your Yoto Client ID in System Configuration before connecting.',
+      });
     }
 
     const params = new URLSearchParams({
       response_type: 'code',
       client_id: clientId,
       redirect_uri: redirectUri,
-      scope: 'openid profile email offline_access',
+      scope: YOTO_PKCE_SCOPES,
       audience: YOTO_API_BASE,
     });
     return res.redirect(`${YOTO_AUTH_BASE}/authorize?${params.toString()}`);
   });
 
   app.get('/api/auth/yoto/callback', async (req, res) => {
-    const { code, device_code, error } = req.query as {
+    const { code, error } = req.query as {
       code?: string;
-      device_code?: string;
       error?: string;
     };
 
@@ -720,34 +869,20 @@ async function startServer() {
       return res.redirect(getFrontendRedirectUrl(`auth_error=${encodeURIComponent(error)}`));
     }
 
-    const { clientId, clientSecret, redirectUri } = getYotoConfig();
-    if (!clientId) {
-      return res.status(400).json({ detail: 'YOTO_CLIENT_ID is not configured in .env.' });
+    const reqClientId = extractRequestYotoClientId(req);
+    const { clientId, clientSecret, redirectUri } = getYotoConfig(reqClientId);
+    if (!clientId || !code) {
+      return res.status(400).json({ detail: 'Missing Yoto Client ID or authorization code.' });
     }
 
     const existing = loadJsonFile<Record<string, any>>(YOTO_TOKEN_FILE) || {};
-    const effectiveDeviceCode = device_code || existing.device_code;
-
-    let payload: Record<string, string>;
-    if (code) {
-      payload = {
-        grant_type: 'authorization_code',
-        client_id: clientId,
-        code,
-        redirect_uri: redirectUri,
-      };
-      if (clientSecret) payload.client_secret = clientSecret;
-    } else if (effectiveDeviceCode) {
-      payload = {
-        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-        device_code: String(effectiveDeviceCode),
-        client_id: clientId,
-      };
-    } else {
-      return res.status(400).json({
-        detail: 'Missing authorization code or device_code for Yoto callback.',
-      });
-    }
+    const payload: Record<string, string> = {
+      grant_type: 'authorization_code',
+      client_id: clientId,
+      code,
+      redirect_uri: redirectUri,
+    };
+    if (clientSecret) payload.client_secret = clientSecret;
 
     try {
       const tokenResp = await fetch(`${YOTO_AUTH_BASE}/oauth/token`, {
@@ -767,13 +902,14 @@ async function startServer() {
         access_token: tokenData.access_token,
         refresh_token: tokenData.refresh_token || existing.refresh_token,
         token_type: tokenData.token_type || 'Bearer',
+        client_id: clientId,
         expires_in: Number(tokenData.expires_in || 3600),
         expires_at: Math.floor(Date.now() / 1000) + Number(tokenData.expires_in || 3600),
       };
       saveJsonFile(YOTO_TOKEN_FILE, storedPayload);
 
-      const profile = await getYotoUserProfile();
-      const displayName = profile?.display_name || 'Yoto Account';
+      const verification = await verifyYotoConnectionViaMine(clientId);
+      const displayName = verification.profile?.display_name || 'Yoto Account';
       addActivity('Yoto Auth', `Connected Yoto account: ${displayName}`, 'success');
       return res.redirect(getFrontendRedirectUrl('yoto_connected=1'));
     } catch (err) {
@@ -787,30 +923,40 @@ async function startServer() {
   // Core Status, Playlists, Activity & Sync Routes
   // =========================================================================
   app.get('/api/status', async (req, res) => {
-    const reqClientId = extractRequestSpotifyClientId(req);
+    const reqSpClientId = extractRequestSpotifyClientId(req);
+    const reqYotoClientId = extractRequestYotoClientId(req);
     const state = loadState();
-    if (reqClientId && reqClientId !== state.settings.spotifyClientId) {
-      state.settings.spotifyClientId = reqClientId;
+    let updatedState = false;
+    if (reqSpClientId && reqSpClientId !== state.settings.spotifyClientId) {
+      state.settings.spotifyClientId = reqSpClientId;
+      updatedState = true;
+    }
+    if (reqYotoClientId && reqYotoClientId !== state.settings.yotoClientId) {
+      state.settings.yotoClientId = reqYotoClientId;
+      updatedState = true;
+    }
+    if (updatedState) {
       saveState(state);
     }
 
-    const { clientId: spId } = getSpotifyConfig(reqClientId);
-    const { clientId: yotoClientId } = getYotoConfig();
+    const { clientId: spId } = getSpotifyConfig(reqSpClientId);
+    const { clientId: yotoClientId } = getYotoConfig(reqYotoClientId);
 
-    const [spotifyProfile, yotoProfile, yotoToken] = await Promise.all([
-      getSpotifyUserProfile(reqClientId),
-      getYotoUserProfile(),
-      getYotoAccessToken(),
+    const [spotifyProfile, yotoVerification] = await Promise.all([
+      getSpotifyUserProfile(reqSpClientId),
+      verifyYotoConnectionViaMine(reqYotoClientId),
     ]);
 
     res.json({
       spotify: Boolean(spotifyProfile),
-      yoto: Boolean(yotoToken),
+      yoto: yotoVerification.verified,
       spotifyConfigured: Boolean(spId),
-      yotoConfigured: Boolean(yotoClientId || yotoToken),
+      yotoConfigured: Boolean(yotoClientId || yotoVerification.verified),
       spotifyClientId: spId || '',
+      yotoClientId: yotoClientId || '',
       spotifyUser: spotifyProfile,
-      yotoUser: yotoProfile,
+      yotoUser: yotoVerification.profile,
+      yotoCards: yotoVerification.cards,
       cachedTracksCount: Object.keys(state.tracks).length,
       settings: state.settings,
     });
@@ -833,12 +979,14 @@ async function startServer() {
   });
 
   app.post('/api/settings', (req, res) => {
-    const reqClientId = extractRequestSpotifyClientId(req);
+    const reqSpClientId = extractRequestSpotifyClientId(req);
+    const reqYotoClientId = extractRequestYotoClientId(req);
     const state = loadState();
     state.settings = {
       ...state.settings,
       ...req.body,
-      ...(reqClientId ? { spotifyClientId: reqClientId } : {}),
+      ...(reqSpClientId ? { spotifyClientId: reqSpClientId } : {}),
+      ...(reqYotoClientId ? { yotoClientId: reqYotoClientId } : {}),
     };
     saveState(state);
     addActivity('System', 'Configuration saved to data/state.json', 'info');
@@ -846,7 +994,8 @@ async function startServer() {
   });
 
   app.post('/api/sync', async (req, res) => {
-    const reqClientId = extractRequestSpotifyClientId(req);
+    const reqSpClientId = extractRequestSpotifyClientId(req);
+    const reqYotoClientId = extractRequestYotoClientId(req);
     const { playlistId, autoSync } = req.body as {
       playlistId?: string;
       autoSync?: boolean;
@@ -857,7 +1006,7 @@ async function startServer() {
       return res.status(400).json({ detail: 'playlistId is required' });
     }
 
-    const token = await getSpotifyUserAccessToken(reqClientId);
+    const token = await getSpotifyUserAccessToken(reqSpClientId);
     if (!token) {
       addActivity(
         'System',
@@ -869,11 +1018,11 @@ async function startServer() {
       });
     }
 
-    const yotoToken = await getYotoAccessToken();
+    const yotoToken = await getYotoAccessToken(reqYotoClientId);
     if (!yotoToken) {
       addActivity('System', 'Sync aborted: Yoto account not connected', 'error');
       return res.status(400).json({
-        detail: 'Yoto account is not connected. Please connect via /api/auth/yoto/login.',
+        detail: 'Yoto account is not connected. Please connect Yoto via PKCE in Config.',
       });
     }
 

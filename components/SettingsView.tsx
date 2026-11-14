@@ -1,15 +1,25 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { AppSettings, AudioProvider, ConnectedUserProfile, DeploymentMode } from '../types';
+import {
+  AppSettings,
+  AudioProvider,
+  ConnectedUserProfile,
+  DeploymentMode,
+  YotoMyoCard,
+} from '../types';
 import {
   exchangeSpotifyPkceCode,
+  exchangeYotoPkceCode,
   getStatus,
   getStoredSpotifyClientId,
+  getStoredYotoClientId,
   getSpotifyRedirectUri,
   openSpotifyPkcePopup,
+  openYotoPkcePopup,
   saveSettings,
   setStoredSpotifyClientId,
+  setStoredYotoClientId,
   SPOTIFY_PKCE_RESULT_STORAGE_KEY,
-  YOTO_LOGIN_URL,
+  YOTO_PKCE_RESULT_STORAGE_KEY,
 } from '../services/api';
 import {
   Save,
@@ -26,6 +36,7 @@ import {
   Copy,
   Check,
   KeyRound,
+  Disc,
 } from 'lucide-react';
 
 interface Props {
@@ -45,19 +56,25 @@ export const SettingsView: React.FC<Props> = ({
   const [spotifyClientId, setSpotifyClientId] = useState<string>(() =>
     getStoredSpotifyClientId() || settings.spotifyClientId || ''
   );
+  const [yotoClientId, setYotoClientId] = useState<string>(() =>
+    getStoredYotoClientId() || settings.yotoClientId || ''
+  );
   const [copiedRedirect, setCopiedRedirect] = useState(false);
   const [connectingSpotify, setConnectingSpotify] = useState(false);
+  const [connectingYoto, setConnectingYoto] = useState(false);
   const [statusInfo, setStatusInfo] = useState<{
     spotify: boolean;
     yoto: boolean;
     spotifyUser: ConnectedUserProfile | null;
     yotoUser: ConnectedUserProfile | null;
+    yotoCards: YotoMyoCard[];
     cachedTracksCount: number;
   }>({
     spotify: false,
     yoto: false,
     spotifyUser: null,
     yotoUser: null,
+    yotoCards: [],
     cachedTracksCount: 0,
   });
   const [saving, setSaving] = useState(false);
@@ -73,17 +90,26 @@ export const SettingsView: React.FC<Props> = ({
         yoto: Boolean(res.yoto),
         spotifyUser: res.spotifyUser || null,
         yotoUser: res.yotoUser || null,
+        yotoCards: Array.isArray(res.yotoCards) ? res.yotoCards : [],
         cachedTracksCount: res.cachedTracksCount || 0,
       });
       if (res.settings) {
         setLocalSettings(res.settings);
       }
-      const storedId = getStoredSpotifyClientId();
-      if (!storedId && (res.spotifyClientId || res.settings?.spotifyClientId)) {
-        const backendId = (res.spotifyClientId || res.settings?.spotifyClientId || '').trim();
-        if (backendId) {
-          setSpotifyClientId(backendId);
-          setStoredSpotifyClientId(backendId);
+      const storedSpId = getStoredSpotifyClientId();
+      if (!storedSpId && (res.spotifyClientId || res.settings?.spotifyClientId)) {
+        const backendSpId = (res.spotifyClientId || res.settings?.spotifyClientId || '').trim();
+        if (backendSpId) {
+          setSpotifyClientId(backendSpId);
+          setStoredSpotifyClientId(backendSpId);
+        }
+      }
+      const storedYotoId = getStoredYotoClientId();
+      if (!storedYotoId && (res.yotoClientId || res.settings?.yotoClientId)) {
+        const backendYotoId = (res.yotoClientId || res.settings?.yotoClientId || '').trim();
+        if (backendYotoId) {
+          setYotoClientId(backendYotoId);
+          setStoredYotoClientId(backendYotoId);
         }
       }
     } catch {
@@ -92,6 +118,7 @@ export const SettingsView: React.FC<Props> = ({
         yoto: false,
         spotifyUser: null,
         yotoUser: null,
+        yotoCards: [],
         cachedTracksCount: 0,
       });
     }
@@ -101,7 +128,7 @@ export const SettingsView: React.FC<Props> = ({
     refreshStatus();
   }, [refreshStatus]);
 
-  const handlePkceCodeReceived = useCallback(
+  const handleSpotifyPkceCodeReceived = useCallback(
     async (code?: string | null, error?: string | null) => {
       if (error) {
         setConnectingSpotify(false);
@@ -127,11 +154,39 @@ export const SettingsView: React.FC<Props> = ({
     [spotifyClientId, refreshStatus, onSpotifyConnected]
   );
 
+  const handleYotoPkceCodeReceived = useCallback(
+    async (code?: string | null, error?: string | null) => {
+      if (error) {
+        setConnectingYoto(false);
+        setErrorMessage(`Yoto authorization error: ${error}`);
+        return;
+      }
+      if (!code) return;
+
+      setConnectingYoto(true);
+      setErrorMessage(null);
+      try {
+        await exchangeYotoPkceCode(code, yotoClientId);
+        await refreshStatus();
+        onSpotifyConnected?.();
+      } catch (err) {
+        setErrorMessage(
+          err instanceof Error ? err.message : 'Yoto PKCE token exchange failed'
+        );
+      } finally {
+        setConnectingYoto(false);
+      }
+    },
+    [yotoClientId, refreshStatus, onSpotifyConnected]
+  );
+
   useEffect(() => {
     const onMessage = (event: MessageEvent) => {
       if (event.origin !== window.location.origin) return;
       if (event.data?.type === 'SPOTIFY_PKCE_CALLBACK') {
-        handlePkceCodeReceived(event.data.code, event.data.error);
+        handleSpotifyPkceCodeReceived(event.data.code, event.data.error);
+      } else if (event.data?.type === 'YOTO_PKCE_CALLBACK') {
+        handleYotoPkceCodeReceived(event.data.code, event.data.error);
       }
     };
 
@@ -140,7 +195,15 @@ export const SettingsView: React.FC<Props> = ({
         try {
           const parsed = JSON.parse(event.newValue);
           localStorage.removeItem(SPOTIFY_PKCE_RESULT_STORAGE_KEY);
-          handlePkceCodeReceived(parsed.code, parsed.error);
+          handleSpotifyPkceCodeReceived(parsed.code, parsed.error);
+        } catch {
+          // ignore malformed storage value
+        }
+      } else if (event.key === YOTO_PKCE_RESULT_STORAGE_KEY && event.newValue) {
+        try {
+          const parsed = JSON.parse(event.newValue);
+          localStorage.removeItem(YOTO_PKCE_RESULT_STORAGE_KEY);
+          handleYotoPkceCodeReceived(parsed.code, parsed.error);
         } catch {
           // ignore malformed storage value
         }
@@ -153,12 +216,18 @@ export const SettingsView: React.FC<Props> = ({
       window.removeEventListener('message', onMessage);
       window.removeEventListener('storage', onStorage);
     };
-  }, [handlePkceCodeReceived]);
+  }, [handleSpotifyPkceCodeReceived, handleYotoPkceCodeReceived]);
 
-  const handleClientIdChange = (value: string) => {
+  const handleSpotifyClientIdChange = (value: string) => {
     setSpotifyClientId(value);
     setStoredSpotifyClientId(value);
     setLocalSettings((prev) => ({ ...prev, spotifyClientId: value.trim() }));
+  };
+
+  const handleYotoClientIdChange = (value: string) => {
+    setYotoClientId(value);
+    setStoredYotoClientId(value);
+    setLocalSettings((prev) => ({ ...prev, yotoClientId: value.trim() }));
   };
 
   const handleCopyRedirectUri = async () => {
@@ -167,7 +236,6 @@ export const SettingsView: React.FC<Props> = ({
       setCopiedRedirect(true);
       setTimeout(() => setCopiedRedirect(false), 2000);
     } catch {
-      // Fallback copy if clipboard API is restricted
       const input = document.createElement('input');
       input.value = redirectUri;
       document.body.appendChild(input);
@@ -189,8 +257,11 @@ export const SettingsView: React.FC<Props> = ({
 
     setConnectingSpotify(true);
     try {
-      // Persist the Client ID to backend settings as well
-      await saveSettings({ ...localSettings, spotifyClientId: trimmedId }).catch(() => {});
+      await saveSettings({
+        ...localSettings,
+        spotifyClientId: trimmedId,
+        yotoClientId: yotoClientId.trim(),
+      }).catch(() => {});
       const popup = await openSpotifyPkcePopup(trimmedId);
       if (!popup) {
         setConnectingSpotify(false);
@@ -206,12 +277,34 @@ export const SettingsView: React.FC<Props> = ({
     }
   };
 
-  const handleConnectYoto = () => {
-    window.open(
-      YOTO_LOGIN_URL,
-      'YotoOAuthPopup',
-      'width=520,height=720,menubar=no,toolbar=no,location=yes,status=no'
-    );
+  const handleConnectYoto = async () => {
+    setErrorMessage(null);
+    const trimmedId = yotoClientId.trim();
+    if (!trimmedId) {
+      setErrorMessage('Please paste your Yoto Client ID above before clicking Connect Yoto.');
+      return;
+    }
+
+    setConnectingYoto(true);
+    try {
+      await saveSettings({
+        ...localSettings,
+        spotifyClientId: spotifyClientId.trim(),
+        yotoClientId: trimmedId,
+      }).catch(() => {});
+      const popup = await openYotoPkcePopup(trimmedId);
+      if (!popup) {
+        setConnectingYoto(false);
+        setErrorMessage(
+          'Popup blocked by browser. Please allow popups for this site and click Connect Yoto again.'
+        );
+      }
+    } catch (err) {
+      setConnectingYoto(false);
+      setErrorMessage(
+        err instanceof Error ? err.message : 'Failed to start Yoto PKCE login'
+      );
+    }
   };
 
   const handleProviderChange = (provider: AudioProvider) => {
@@ -229,6 +322,7 @@ export const SettingsView: React.FC<Props> = ({
       const updated = await saveSettings({
         ...localSettings,
         spotifyClientId: spotifyClientId.trim(),
+        yotoClientId: yotoClientId.trim(),
       });
       onSave(updated);
     } catch (err) {
@@ -264,12 +358,12 @@ export const SettingsView: React.FC<Props> = ({
             </span>
           </div>
           <p className="text-gray-400 text-xs leading-relaxed">
-            Spotify uses browser-based <strong>OAuth 2.0 PKCE</strong> in a popup window — only your{' '}
-            <strong>Spotify Client ID</strong> is required (no Client Secret or <code>.env</code>{' '}
-            file needed).
+            Both Spotify and Yoto authenticate via browser-based <strong>OAuth 2.0 PKCE</strong> in
+            a popup window — only your <strong>Client IDs</strong> are required (no Client Secrets
+            or <code>.env</code> file needed).
           </p>
 
-          {/* Spotify Developer Dashboard Setup: Client ID Input + Exact Redirect URI Copy */}
+          {/* Developer Dashboard Setup: Spotify Client ID + Yoto Client ID + Exact Redirect URI Copy */}
           <div className="bg-black/40 rounded-xl p-4 border border-white/10 space-y-4">
             <div>
               <label className="block text-xs font-bold text-gray-300 mb-1.5 flex items-center gap-1.5">
@@ -279,19 +373,35 @@ export const SettingsView: React.FC<Props> = ({
               <input
                 type="text"
                 value={spotifyClientId}
-                onChange={(e) => handleClientIdChange(e.target.value)}
+                onChange={(e) => handleSpotifyClientIdChange(e.target.value)}
                 placeholder="Paste your Spotify Client ID (e.g. 4b8f9c2a...)"
                 className="w-full bg-white/5 border border-white/15 rounded-lg px-3 py-2.5 text-white text-xs font-mono focus:border-spotify-green focus:outline-none"
               />
               <p className="text-[11px] text-gray-500 mt-1">
-                Saved automatically to <code>localStorage</code> and sent to the backend via{' '}
-                <code>X-Spotify-Client-Id</code>.
+                Saved to <code>localStorage</code> and passed via <code>X-Spotify-Client-Id</code>.
+              </p>
+            </div>
+
+            <div>
+              <label className="block text-xs font-bold text-gray-300 mb-1.5 flex items-center gap-1.5">
+                <KeyRound size={14} className="text-yoto-orange" />
+                <span>Yoto Client ID</span>
+              </label>
+              <input
+                type="text"
+                value={yotoClientId}
+                onChange={(e) => handleYotoClientIdChange(e.target.value)}
+                placeholder="Paste your Yoto Client ID (from Yoto Developer Dashboard)"
+                className="w-full bg-white/5 border border-white/15 rounded-lg px-3 py-2.5 text-white text-xs font-mono focus:border-yoto-orange focus:outline-none"
+              />
+              <p className="text-[11px] text-gray-500 mt-1">
+                Saved to <code>localStorage</code> and passed via <code>X-Yoto-Client-Id</code>.
               </p>
             </div>
 
             <div>
               <label className="block text-xs font-bold text-gray-300 mb-1.5">
-                Spotify Redirect URI (Paste into your Spotify Developer Dashboard)
+                Redirect URI (Paste into your Spotify &amp; Yoto Developer Dashboards)
               </label>
               <div className="flex items-center gap-2">
                 <input
@@ -381,7 +491,7 @@ export const SettingsView: React.FC<Props> = ({
               </button>
             </div>
 
-            {/* Yoto OAuth Card */}
+            {/* Yoto OAuth PKCE Card */}
             <div className="p-4 rounded-xl bg-black/30 border border-white/10 flex flex-col justify-between space-y-4">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-bold text-white">Yoto Account</span>
@@ -413,44 +523,84 @@ export const SettingsView: React.FC<Props> = ({
                       {statusInfo.yotoUser.display_name}
                     </div>
                     <div className="text-[11px] text-gray-400 truncate">
-                      Token cached in data/yoto_token.json
+                      Verified via GET /content/mine ({statusInfo.yotoCards.length} MYO cards)
                     </div>
                   </div>
                 </div>
               ) : (
                 <div className="text-xs text-gray-500 py-2">
-                  Disconnected — authorize Yoto Developer API to upload MYO audio and update cards.
+                  Disconnected — paste your Yoto Client ID above and click Connect Yoto.
                 </div>
               )}
 
               <button
                 type="button"
                 onClick={handleConnectYoto}
-                className="w-full py-2.5 px-4 rounded-lg bg-yoto-orange hover:bg-orange-500 text-white font-bold text-xs flex items-center justify-center space-x-2 transition-colors"
+                disabled={connectingYoto}
+                className="w-full py-2.5 px-4 rounded-lg bg-yoto-orange hover:bg-orange-500 text-white font-bold text-xs flex items-center justify-center space-x-2 transition-colors disabled:opacity-60"
               >
-                <span>{statusInfo.yoto ? 'Reconnect Yoto' : 'Connect Yoto'}</span>
+                <span>
+                  {connectingYoto
+                    ? 'Waiting for Yoto Popup...'
+                    : statusInfo.yoto
+                    ? 'Reconnect Yoto'
+                    : 'Connect Yoto'}
+                </span>
                 <ExternalLink size={13} />
               </button>
             </div>
           </div>
 
-          <div className="bg-black/40 rounded-xl p-4 border border-white/5 text-xs space-y-2">
-            <div className="text-gray-300 font-semibold flex items-center gap-1.5">
-              <Database size={13} className="text-emerald-400" />
-              <span>Optional `.env` Variables (Local / Docker):</span>
+          {/* Existing Yoto MYO Cards from GET https://api.yotoplay.com/content/mine */}
+          {statusInfo.yoto && (
+            <div className="bg-black/40 rounded-xl p-4 border border-white/10 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                  <Disc size={14} className="text-yoto-orange" />
+                  <span>
+                    Existing Yoto MYO Cards &amp; Playlists (<code>GET /content/mine</code>)
+                  </span>
+                </div>
+                <span className="text-[11px] text-yoto-orange font-mono font-bold">
+                  {statusInfo.yotoCards.length} found
+                </span>
+              </div>
+
+              {statusInfo.yotoCards.length > 0 ? (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 max-h-48 overflow-y-auto pr-1">
+                  {statusInfo.yotoCards.map((card) => (
+                    <div
+                      key={card.cardId}
+                      onClick={() =>
+                        setLocalSettings({ ...localSettings, yotoCardId: card.cardId })
+                      }
+                      className={`p-2.5 rounded-lg border text-xs cursor-pointer transition-colors flex items-center justify-between ${
+                        localSettings.yotoCardId === card.cardId
+                          ? 'bg-yoto-orange/15 border-yoto-orange text-white'
+                          : 'bg-white/5 border-white/5 text-gray-300 hover:bg-white/10'
+                      }`}
+                    >
+                      <div className="min-w-0 pr-2">
+                        <div className="font-semibold text-white truncate">{card.title}</div>
+                        <div className="text-[10px] text-gray-400 font-mono truncate">
+                          cardId: {card.cardId}
+                          {card.trackCount ? ` • ${card.trackCount} tracks` : ''}
+                        </div>
+                      </div>
+                      <span className="text-[10px] text-yoto-orange shrink-0 font-semibold">
+                        {localSettings.yotoCardId === card.cardId ? 'Selected' : 'Use ID'}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-xs text-gray-500">
+                  Connected and verified via <code>GET https://api.yotoplay.com/content/mine</code>{' '}
+                  — no existing MYO cards found in your Yoto account yet.
+                </div>
+              )}
             </div>
-            <div className="grid grid-cols-1 gap-1.5 font-mono text-[11px] text-gray-400">
-              <div>
-                <span className="text-spotify-green">SPOTIPY_CLIENT_ID</span>=optional_if_set_in_ui
-              </div>
-              <div>
-                <span className="text-yoto-orange">YOTO_CLIENT_ID</span>=your_yoto_client_id
-              </div>
-              <div>
-                <span className="text-yoto-orange">YOTO_ACCESS_TOKEN</span>=optional_direct_yoto_token
-              </div>
-            </div>
-          </div>
+          )}
         </div>
 
         {/* Audio Source Strategy */}

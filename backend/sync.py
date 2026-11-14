@@ -291,14 +291,32 @@ def get_spotify_user_profile(override_client_id: Optional[str] = None) -> Option
 
 
 # =============================================================================
-# Yoto OAuth / Device Code Flow (data/yoto_token.json)
+# Yoto OAuth 2.0 PKCE & Token Flow (data/yoto_token.json)
 # =============================================================================
-def get_yoto_oauth_credentials() -> tuple[Optional[str], Optional[str]]:
-    client_id = os.environ.get("YOTO_CLIENT_ID")
+YOTO_PKCE_SCOPES = "user:content:manage family:library:manage"
+
+
+def get_yoto_oauth_credentials(override_client_id: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    state = store.load()
+    saved_client_id = (state.get("settings") or {}).get("yotoClientId")
+    token_client_id = None
+    if YOTO_TOKEN_PATH.exists():
+        try:
+            tok = json.loads(YOTO_TOKEN_PATH.read_text(encoding="utf-8"))
+            token_client_id = tok.get("client_id")
+        except Exception:
+            pass
+
+    client_id = (
+        override_client_id
+        or saved_client_id
+        or token_client_id
+        or os.environ.get("YOTO_CLIENT_ID")
+    )
     client_secret = os.environ.get("YOTO_CLIENT_SECRET")
     return (
-        client_id.strip() if client_id else None,
-        client_secret.strip() if client_secret else None,
+        client_id.strip() if isinstance(client_id, str) and client_id.strip() else None,
+        client_secret.strip() if isinstance(client_secret, str) and client_secret.strip() else None,
     )
 
 
@@ -327,14 +345,17 @@ def save_yoto_token_data(token_payload: Dict[str, Any]) -> Dict[str, Any]:
     return token_payload
 
 
-def refresh_yoto_token_if_needed(token_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def refresh_yoto_token_if_needed(
+    token_data: Dict[str, Any],
+    override_client_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
     expires_at = token_data.get("expires_at")
     now = int(time.time())
     if not expires_at or now < int(expires_at) - 60:
         return token_data
 
     refresh_token = token_data.get("refresh_token")
-    client_id, client_secret = get_yoto_oauth_credentials()
+    client_id, client_secret = get_yoto_oauth_credentials(override_client_id or token_data.get("client_id"))
     if not refresh_token or not client_id:
         return token_data
 
@@ -344,7 +365,7 @@ def refresh_yoto_token_if_needed(token_data: Dict[str, Any]) -> Optional[Dict[st
             "client_id": client_id,
             "refresh_token": refresh_token,
         }
-        if client_secret:
+        if client_secret and not token_data.get("pkce"):
             payload["client_secret"] = client_secret
 
         resp = requests.post(
@@ -358,6 +379,7 @@ def refresh_yoto_token_if_needed(token_data: Dict[str, Any]) -> Optional[Dict[st
         merged = {
             **token_data,
             **refreshed,
+            "client_id": client_id,
             "refresh_token": refreshed.get("refresh_token", refresh_token),
         }
         return save_yoto_token_data(merged)
@@ -366,65 +388,122 @@ def refresh_yoto_token_if_needed(token_data: Dict[str, Any]) -> Optional[Dict[st
         return token_data
 
 
-def get_yoto_token() -> Optional[str]:
+def get_yoto_token(override_client_id: Optional[str] = None) -> Optional[str]:
     token_data = load_yoto_token_data()
     if not token_data:
         return None
-    token_data = refresh_yoto_token_if_needed(token_data) or token_data
+    token_data = refresh_yoto_token_if_needed(token_data, override_client_id) or token_data
     access_token = token_data.get("access_token")
     return access_token.strip() if isinstance(access_token, str) and access_token.strip() else None
 
 
-def fetch_yoto_user_profile(access_token: str) -> Dict[str, Any]:
-    for url in [f"{YOTO_AUTH_BASE}/userinfo", f"{YOTO_API_BASE}/user"]:
-        try:
-            resp = requests.get(
-                url,
-                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                info = resp.json()
-                user_obj = info.get("user") if isinstance(info.get("user"), dict) else info
-                display_name = (
-                    user_obj.get("name")
-                    or user_obj.get("nickname")
-                    or user_obj.get("preferred_username")
-                    or user_obj.get("email")
-                    or user_obj.get("sub")
-                    or "Yoto Account"
-                )
-                avatar = user_obj.get("picture") or user_obj.get("avatar")
-                return {
-                    "id": user_obj.get("sub") or user_obj.get("id"),
-                    "display_name": str(display_name),
-                    "avatar": avatar,
-                    "email": user_obj.get("email"),
-                }
-        except Exception:
+def parse_yoto_mine_cards(raw: Any) -> List[Dict[str, Any]]:
+    raw_list: List[Any] = []
+    if isinstance(raw, list):
+        raw_list = raw
+    elif isinstance(raw, dict):
+        if isinstance(raw.get("cards"), list):
+            raw_list = raw["cards"]
+        elif isinstance(raw.get("content"), list):
+            raw_list = raw["content"]
+
+    cards_out: List[Dict[str, Any]] = []
+    for item in raw_list:
+        if not isinstance(item, dict):
             continue
+        card_id = item.get("cardId") or item.get("id") or item.get("_id")
+        if not card_id:
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        content = item.get("content") if isinstance(item.get("content"), dict) else {}
+        chapters = content.get("chapters") if isinstance(content.get("chapters"), list) else []
+        track_count = 0
+        for ch in chapters:
+            if isinstance(ch, dict) and isinstance(ch.get("tracks"), list):
+                track_count += len(ch["tracks"])
+        cover_obj = metadata.get("cover") if isinstance(metadata.get("cover"), dict) else {}
+        cover_url = (
+            cover_obj.get("imageL")
+            or cover_obj.get("imageM")
+            or cover_obj.get("imageS")
+            or item.get("coverImageUrl")
+        )
+        cards_out.append(
+            {
+                "cardId": str(card_id),
+                "title": str(item.get("title") or metadata.get("title") or f"MYO Card {card_id}"),
+                "description": metadata.get("description"),
+                "coverImageUrl": cover_url,
+                "trackCount": track_count or len(chapters) or None,
+                "updatedAt": item.get("updatedAt"),
+            }
+        )
+    return cards_out
 
-    return {
-        "display_name": "Yoto Account",
-        "avatar": None,
-    }
 
-
-def get_yoto_user_profile() -> Optional[Dict[str, Any]]:
-    token_data = load_yoto_token_data()
-    if not token_data:
-        return None
-    token_data = refresh_yoto_token_if_needed(token_data) or token_data
-    access_token = token_data.get("access_token")
+def verify_yoto_connection_via_mine(
+    override_client_id: Optional[str] = None,
+) -> tuple[bool, Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    access_token = get_yoto_token(override_client_id)
     if not access_token:
-        return None
-    if isinstance(token_data.get("profile"), dict) and token_data["profile"].get("display_name"):
-        return token_data["profile"]
-    profile = fetch_yoto_user_profile(access_token)
-    if YOTO_TOKEN_PATH.exists():
-        token_data["profile"] = profile
-        save_yoto_token_data(token_data)
-    return profile
+        return False, None, []
+
+    token_data = load_yoto_token_data() or {}
+    try:
+        resp = requests.get(
+            f"{YOTO_API_BASE}/content/mine",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return False, None, []
+
+        mine_json = resp.json()
+        cards = parse_yoto_mine_cards(mine_json)
+
+        profile = token_data.get("profile") if isinstance(token_data.get("profile"), dict) else {}
+        display_name = profile.get("display_name") or ""
+        avatar = profile.get("avatar")
+        user_id = profile.get("id") or "yoto-user"
+
+        if not display_name or display_name == "Yoto Account":
+            try:
+                u_resp = requests.get(
+                    f"{YOTO_AUTH_BASE}/userinfo",
+                    headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                    timeout=10,
+                )
+                if u_resp.status_code == 200:
+                    u = u_resp.json()
+                    display_name = (
+                        u.get("name")
+                        or u.get("nickname")
+                        or u.get("preferred_username")
+                        or u.get("email")
+                        or u.get("sub")
+                        or ""
+                    )
+                    avatar = u.get("picture") or u.get("avatar")
+                    user_id = u.get("sub") or u.get("id") or user_id
+            except Exception:
+                pass
+
+        user_profile: Dict[str, Any] = {
+            "id": user_id,
+            "display_name": str(display_name or f"Yoto Library ({len(cards)} MYO Cards)"),
+            "avatar": avatar,
+            "cardCount": len(cards),
+        }
+
+        if YOTO_TOKEN_PATH.exists():
+            token_data["profile"] = user_profile
+            token_data["cards"] = cards
+            save_yoto_token_data(token_data)
+
+        return True, user_profile, cards
+    except Exception as exc:
+        logger.warning(f"Failed to verify Yoto connection via /content/mine: {exc}")
+        return False, None, []
 
 
 def format_duration_ms(duration_ms: int) -> str:
@@ -680,6 +759,7 @@ class SyncRequest(BaseModel):
     autoSync: Optional[bool] = True
     targetYotoId: Optional[str] = None
     spotifyClientId: Optional[str] = None
+    yotoClientId: Optional[str] = None
 
 
 class SettingsUpdateRequest(BaseModel):
@@ -692,6 +772,7 @@ class SettingsUpdateRequest(BaseModel):
     githubRepo: str = "yotofy"
     yotoCardId: Optional[str] = ""
     spotifyClientId: Optional[str] = ""
+    yotoClientId: Optional[str] = ""
 
 
 class SpotifyPkceRequest(BaseModel):
@@ -701,8 +782,24 @@ class SpotifyPkceRequest(BaseModel):
     clientId: Optional[str] = None
 
 
+class YotoPkceRequest(BaseModel):
+    code: str
+    codeVerifier: str
+    redirectUri: str
+    clientId: Optional[str] = None
+
+
 def extract_request_client_id(request: Request, body_client_id: Optional[str] = None) -> Optional[str]:
     header_val = request.headers.get("x-spotify-client-id")
+    if header_val and header_val.strip():
+        return header_val.strip()
+    if body_client_id and body_client_id.strip():
+        return body_client_id.strip()
+    return None
+
+
+def extract_request_yoto_client_id(request: Request, body_client_id: Optional[str] = None) -> Optional[str]:
+    header_val = request.headers.get("x-yoto-client-id")
     if header_val and header_val.strip():
         return header_val.strip()
     if body_client_id and body_client_id.strip():
@@ -842,49 +939,110 @@ def spotify_callback(
 
 
 # -----------------------------------------------------------------------------
-# Yoto OAuth / Device Code Endpoints
+# Yoto OAuth 2.0 PKCE & Standard OAuth Endpoints
 # -----------------------------------------------------------------------------
-@app.get("/api/auth/yoto/login")
-def yoto_login(
-    flow: Optional[str] = Query(default=None),
-    format: Optional[str] = Query(default=None),
-):
-    client_id, _ = get_yoto_oauth_credentials()
+@app.post("/api/auth/yoto/pkce")
+def yoto_pkce_exchange(payload: YotoPkceRequest, request: Request):
+    req_client_id = extract_request_yoto_client_id(request, payload.clientId)
+    client_id, _ = get_yoto_oauth_credentials(req_client_id)
     if not client_id:
         raise HTTPException(
             status_code=400,
-            detail="YOTO_CLIENT_ID must be set in .env before logging in with Yoto.",
+            detail="Yoto Client ID is required for PKCE token exchange.",
         )
 
-    auth_mode = flow or os.environ.get("YOTO_AUTH_FLOW", "oauth")
-    if auth_mode == "device":
-        try:
-            resp = requests.post(
-                f"{YOTO_AUTH_BASE}/oauth/device/code",
-                data={
-                    "client_id": client_id,
-                    "scope": "openid profile offline_access user:content:manage",
-                    "audience": YOTO_API_BASE,
-                },
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                timeout=20,
+    state = store.load()
+    state.setdefault("settings", dict(DEFAULT_SETTINGS))["yotoClientId"] = client_id
+    store.save(state)
+
+    try:
+        resp = requests.post(
+            f"{YOTO_AUTH_BASE}/oauth/token",
+            data={
+                "grant_type": "authorization_code",
+                "client_id": client_id,
+                "code": payload.code,
+                "redirect_uri": payload.redirectUri,
+                "code_verifier": payload.codeVerifier,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            err_text = resp.text
+            store.add_activity("System", "Yoto PKCE token exchange failed", "error", err_text)
+            raise HTTPException(status_code=400, detail=f"Yoto PKCE token exchange failed: {err_text}")
+
+        token_json = resp.json()
+        access_token = token_json.get("access_token")
+        if not access_token:
+            raise RuntimeError("No access_token returned from Yoto OAuth endpoint")
+
+        existing = load_yoto_token_data() or {}
+        save_yoto_token_data(
+            {
+                "access_token": access_token,
+                "refresh_token": token_json.get("refresh_token") or existing.get("refresh_token"),
+                "token_type": token_json.get("token_type", "Bearer"),
+                "client_id": client_id,
+                "pkce": True,
+                "expires_in": token_json.get("expires_in"),
+                "scope": token_json.get("scope", YOTO_PKCE_SCOPES),
+            }
+        )
+
+        # Verify connection by calling GET https://api.yotoplay.com/content/mine
+        verified, profile, cards = verify_yoto_connection_via_mine(client_id)
+        if not verified:
+            store.add_activity(
+                "System",
+                "Yoto token obtained, but GET /content/mine verification failed",
+                "warning",
             )
-            resp.raise_for_status()
-            device_data = resp.json()
-            save_yoto_token_data({"pending_device_code": device_data.get("device_code"), **device_data})
-            target_url = device_data.get("verification_uri_complete") or device_data.get("verification_uri")
-            if format == "json":
-                return {"url": target_url, "device": device_data}
-            return RedirectResponse(url=target_url, status_code=302)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Yoto device authorization failed: {exc}")
+            raise HTTPException(
+                status_code=400,
+                detail="Yoto token obtained, but GET https://api.yotoplay.com/content/mine failed verification.",
+            )
+
+        store.add_activity(
+            "System",
+            f"Verified Yoto connection via /content/mine ({len(cards)} MYO cards)",
+            "success",
+            f"Saved PKCE token cache to {YOTO_TOKEN_PATH}",
+        )
+        return {
+            "status": "ok",
+            "yotoUser": profile,
+            "yotoCards": cards,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Yoto PKCE error: {exc}")
+        store.add_activity("System", f"Yoto PKCE exchange failed: {exc}", "error")
+        raise HTTPException(status_code=500, detail=f"Yoto PKCE exchange failed: {exc}")
+
+
+@app.get("/api/auth/yoto/login")
+def yoto_login(
+    request: Request,
+    flow: Optional[str] = Query(default=None),
+    format: Optional[str] = Query(default=None),
+):
+    req_client_id = extract_request_yoto_client_id(request)
+    client_id, _ = get_yoto_oauth_credentials(req_client_id)
+    if not client_id:
+        raise HTTPException(
+            status_code=400,
+            detail="Paste your Yoto Client ID in System Configuration before connecting.",
+        )
 
     params = urlencode(
         {
             "client_id": client_id,
             "response_type": "code",
             "redirect_uri": DEFAULT_YOTO_REDIRECT_URI,
-            "scope": "openid profile offline_access user:content:manage",
+            "scope": YOTO_PKCE_SCOPES,
             "audience": YOTO_API_BASE,
         }
     )
@@ -896,40 +1054,30 @@ def yoto_login(
 
 @app.get("/api/auth/yoto/callback")
 def yoto_callback(
+    request: Request,
     code: Optional[str] = Query(default=None),
-    device_code: Optional[str] = Query(default=None),
     error: Optional[str] = Query(default=None),
 ):
     if error:
         store.add_activity("System", f"Yoto OAuth failed: {error}", "error")
         return RedirectResponse(url=f"{FRONTEND_URL}/?auth_error={error}", status_code=302)
 
-    client_id, client_secret = get_yoto_oauth_credentials()
-    if not client_id:
-        raise HTTPException(status_code=400, detail="YOTO_CLIENT_ID is not configured.")
+    req_client_id = extract_request_yoto_client_id(request)
+    client_id, client_secret = get_yoto_oauth_credentials(req_client_id)
+    if not client_id or not code:
+        raise HTTPException(status_code=400, detail="Missing Yoto Client ID or authorization code.")
 
     existing = load_yoto_token_data() or {}
-    resolved_device_code = device_code or existing.get("pending_device_code")
+    payload: Dict[str, str] = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "code": code,
+        "redirect_uri": DEFAULT_YOTO_REDIRECT_URI,
+    }
+    if client_secret:
+        payload["client_secret"] = client_secret
 
     try:
-        if code:
-            payload: Dict[str, str] = {
-                "grant_type": "authorization_code",
-                "client_id": client_id,
-                "code": code,
-                "redirect_uri": DEFAULT_YOTO_REDIRECT_URI,
-            }
-            if client_secret:
-                payload["client_secret"] = client_secret
-        elif resolved_device_code:
-            payload = {
-                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                "client_id": client_id,
-                "device_code": resolved_device_code,
-            }
-        else:
-            raise HTTPException(status_code=400, detail="Missing authorization code or device_code for Yoto.")
-
         resp = requests.post(
             f"{YOTO_AUTH_BASE}/oauth/token",
             data=payload,
@@ -943,20 +1091,21 @@ def yoto_callback(
         if not access_token:
             raise RuntimeError("No access_token returned from Yoto OAuth endpoint")
 
-        profile = fetch_yoto_user_profile(access_token)
         save_yoto_token_data(
             {
                 "access_token": access_token,
-                "refresh_token": token_json.get("refresh_token"),
+                "refresh_token": token_json.get("refresh_token") or existing.get("refresh_token"),
                 "token_type": token_json.get("token_type", "Bearer"),
+                "client_id": client_id,
                 "expires_in": token_json.get("expires_in"),
                 "scope": token_json.get("scope"),
-                "profile": profile,
             }
         )
+        verified, profile, cards = verify_yoto_connection_via_mine(client_id)
+        display_name = (profile or {}).get("display_name", "Yoto Account")
         store.add_activity(
             "System",
-            f"Connected Yoto account: {profile.get('display_name', 'Yoto Account')}",
+            f"Connected Yoto account: {display_name} ({len(cards)} MYO cards)",
             "success",
             f"Saved access_token & refresh_token to {YOTO_TOKEN_PATH}",
         )
@@ -971,26 +1120,35 @@ def yoto_callback(
 
 @app.get("/api/status")
 def api_status(request: Request):
-    req_client_id = extract_request_client_id(request)
+    req_sp_client_id = extract_request_client_id(request)
+    req_yoto_client_id = extract_request_yoto_client_id(request)
     state = store.load()
-    if req_client_id:
-        state.setdefault("settings", dict(DEFAULT_SETTINGS))["spotifyClientId"] = req_client_id
+    dirty = False
+    if req_sp_client_id:
+        state.setdefault("settings", dict(DEFAULT_SETTINGS))["spotifyClientId"] = req_sp_client_id
+        dirty = True
+    if req_yoto_client_id:
+        state.setdefault("settings", dict(DEFAULT_SETTINGS))["yotoClientId"] = req_yoto_client_id
+        dirty = True
+    if dirty:
         store.save(state)
 
-    sp_client_id, _ = get_spotify_credentials(req_client_id)
-    spotify_profile = get_spotify_user_profile(req_client_id)
-    yoto_profile = get_yoto_user_profile()
-    sp_client = create_spotify_client(req_client_id)
-    yoto_token = get_yoto_token()
+    sp_client_id, _ = get_spotify_credentials(req_sp_client_id)
+    yoto_client_id, _ = get_yoto_oauth_credentials(req_yoto_client_id)
+    spotify_profile = get_spotify_user_profile(req_sp_client_id)
+    sp_client = create_spotify_client(req_sp_client_id)
+    yoto_verified, yoto_profile, yoto_cards = verify_yoto_connection_via_mine(req_yoto_client_id)
 
     return {
         "spotify": bool(spotify_profile or sp_client is not None),
-        "yoto": bool(yoto_profile or (yoto_token and len(yoto_token) > 8)),
+        "yoto": bool(yoto_verified),
         "spotifyConfigured": bool(sp_client_id),
-        "yotoConfigured": bool(get_yoto_oauth_credentials()[0] or yoto_token),
+        "yotoConfigured": bool(yoto_client_id or yoto_verified),
         "spotifyClientId": sp_client_id or "",
+        "yotoClientId": yoto_client_id or "",
         "spotifyUser": spotify_profile,
         "yotoUser": yoto_profile,
+        "yotoCards": yoto_cards,
         "cachedTracksCount": len(state.get("tracks", {})),
         "settings": state.get("settings", DEFAULT_SETTINGS),
     }
@@ -1044,11 +1202,14 @@ def api_activity():
 
 @app.post("/api/settings")
 def api_save_settings(payload: SettingsUpdateRequest, request: Request):
-    req_client_id = extract_request_client_id(request, payload.spotifyClientId)
+    req_sp_client_id = extract_request_client_id(request, payload.spotifyClientId)
+    req_yoto_client_id = extract_request_yoto_client_id(request, payload.yotoClientId)
     state = store.load()
     dumped = payload.model_dump()
-    if req_client_id:
-        dumped["spotifyClientId"] = req_client_id
+    if req_sp_client_id:
+        dumped["spotifyClientId"] = req_sp_client_id
+    if req_yoto_client_id:
+        dumped["yotoClientId"] = req_yoto_client_id
     state["settings"] = dumped
     store.save(state)
     store.add_activity("System", "Configuration saved to data/state.json", "info")

@@ -77,6 +77,15 @@ export interface YotoCardConfig {
   lastSynced?: Date;
 }
 
+export interface YotoMyoCard {
+  cardId: string;
+  title: string;
+  description?: string;
+  coverImageUrl?: string;
+  trackCount?: number;
+  updatedAt?: string;
+}
+
 export type ScreenState = 'dashboard' | 'detail' | 'settings';
 
 export type AudioProvider =
@@ -97,6 +106,7 @@ export interface AppSettings {
   githubRepo: string;
   yotoCardId?: string;
   spotifyClientId?: string;
+  yotoClientId?: string;
 }
 
 export interface ConnectedUserProfile {
@@ -104,6 +114,7 @@ export interface ConnectedUserProfile {
   display_name: string;
   avatar?: string | null;
   email?: string;
+  cardCount?: number;
 }
 
 export interface ActivityLog {
