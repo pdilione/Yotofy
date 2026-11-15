@@ -13,17 +13,18 @@ services:
     environment:
       - API_PORT=8000
       - AUDIO_DIR=/music
-      - DATA_DIR=/data
-      - STATE_FILE_PATH=/data/state.json
-      - SPOTIFY_TOKEN_PATH=/data/spotify_token.json
-      - YOTO_TOKEN_PATH=/data/yoto_token.json
-      - ZOTIFY_CREDENTIALS_PATH=/data/credentials.json
+      - DATA_DIR=/app/data
+      - STATE_FILE_PATH=/app/data/state.json
+      - SPOTIFY_TOKEN_PATH=/app/data/spotify_token.json
+      - YOTO_TOKEN_PATH=/app/data/yoto_token.json
+      - ZOTIFY_CREDENTIALS_PATH=/app/data/credentials.json
       - FRONTEND_DIST_DIR=/app/dist
       - SPOTIPY_CLIENT_ID=${SPOTIPY_CLIENT_ID:-}
       - YOTO_CLIENT_ID=${YOTO_CLIENT_ID:-}
     volumes:
-      - ./data:/data
+      - ./data:/app/data
       - ./music:/music
+
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')\""]
       interval: 30s

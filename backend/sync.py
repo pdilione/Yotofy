@@ -36,12 +36,12 @@ logger = logging.getLogger("yotofy-sync")
 YOTO_API_BASE = os.environ.get("YOTO_API_BASE", "https://api.yotoplay.com").rstrip("/")
 YOTO_AUTH_BASE = os.environ.get("YOTO_AUTH_BASE", "https://login.yotoplay.com").rstrip("/")
 AUDIO_DIR = Path(os.environ.get("AUDIO_DIR", "/music" if Path("/music").exists() else "public/audio"))
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data" if Path("/data").exists() else "data"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/app/data" if Path("/app/data").exists() else ("/data" if Path("/data").exists() else "data")))
 
 STATE_FILE_PATH = Path(os.environ.get("STATE_FILE_PATH", str(DATA_DIR / "state.json")))
 SPOTIFY_TOKEN_PATH = Path(os.environ.get("SPOTIFY_TOKEN_PATH", str(DATA_DIR / "spotify_token.json")))
 YOTO_TOKEN_PATH = Path(os.environ.get("YOTO_TOKEN_PATH", str(DATA_DIR / "yoto_token.json")))
-ZOTIFY_CREDENTIALS_PATH = Path(os.environ.get("ZOTIFY_CREDENTIALS_PATH", str(DATA_DIR / "credentials.json")))
+ZOTIFY_CREDENTIALS_PATH = Path(os.environ.get("ZOTIFY_CREDENTIALS_PATH", "/app/data/credentials.json"))
 ROOT_DIR = Path(__file__).resolve().parent.parent
 _default_dist = ROOT_DIR / "dist" if (ROOT_DIR / "dist").exists() else Path("dist")
 DIST_DIR = Path(os.environ.get("FRONTEND_DIST_DIR", str(_default_dist)))
@@ -590,7 +590,7 @@ def build_playlist_payload(raw_pl: Dict[str, Any], sp: spotipy.Spotify, state: D
     return result
 
 
-def prepare_zotify_credentials() -> Optional[Path]:
+def prepare_zotify_credentials() -> Path:
     creds_json = os.environ.get("ZOTIFY_CREDENTIALS_JSON")
     if creds_json:
         ZOTIFY_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -598,10 +598,13 @@ def prepare_zotify_credentials() -> Optional[Path]:
         return ZOTIFY_CREDENTIALS_PATH
     if ZOTIFY_CREDENTIALS_PATH.exists():
         return ZOTIFY_CREDENTIALS_PATH
-    return None
+    fallback_creds = DATA_DIR / "credentials.json"
+    if fallback_creds.exists():
+        return fallback_creds
+    return ZOTIFY_CREDENTIALS_PATH
 
 
-def download_track_with_zotify(track_id: str, track_title: str, creds_path: Optional[Path]) -> Optional[Path]:
+def download_track_with_zotify(track_id: str, track_title: str, creds_path: Optional[Path] = None) -> Optional[Path]:
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     target_path = AUDIO_DIR / f"{track_id}.mp3"
     if target_path.exists() and target_path.stat().st_size > 0:
@@ -611,12 +614,15 @@ def download_track_with_zotify(track_id: str, track_title: str, creds_path: Opti
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
+    credentials_file = str(creds_path or ZOTIFY_CREDENTIALS_PATH)
     cmd = [
         sys.executable,
         "-m",
         "zotify",
         f"https://open.spotify.com/track/{track_id}",
-        "--root-path",
+        "--credentials",
+        credentials_file,
+        "--library",
         str(tmp_dir),
         "--output",
         "{song_name}.{ext}",
@@ -624,11 +630,7 @@ def download_track_with_zotify(track_id: str, track_title: str, creds_path: Opti
         "mp3",
         "--download-quality",
         "very_high",
-        "--download-real-time",
-        "False",
     ]
-    if creds_path and creds_path.exists():
-        cmd.extend(["--credentials-location", str(creds_path)])
 
     logger.info(f"Downloading '{track_title}' ({track_id}) via Zotify...")
     try:
