@@ -9,8 +9,7 @@ services:
     ports:
       - "${API_PORT:-8000}:8000"
     env_file:
-      - path: .env
-        required: false
+      - .env
     environment:
       - API_PORT=8000
       - AUDIO_DIR=/music
@@ -21,10 +20,7 @@ services:
       - ZOTIFY_CREDENTIALS_PATH=/data/credentials.json
       - FRONTEND_DIST_DIR=/app/dist
       - SPOTIPY_CLIENT_ID=${SPOTIPY_CLIENT_ID:-}
-      - SPOTIPY_CLIENT_SECRET=${SPOTIPY_CLIENT_SECRET:-}
       - YOTO_CLIENT_ID=${YOTO_CLIENT_ID:-}
-      - YOTO_ACCESS_TOKEN=${YOTO_ACCESS_TOKEN:-}
-      - YOTO_CARD_ID=${YOTO_CARD_ID:-}
     volumes:
       - ./data:/data
       - ./music:/music
@@ -34,4 +30,3 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
-
