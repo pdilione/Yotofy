@@ -6,13 +6,14 @@ FROM node:20-alpine AS frontend-builder
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
-RUN npm ci
+RUN npm ci --include=optional && \
+    ([ -d node_modules/@rollup/rollup-linux-x64-musl ] || npm install --no-save @rollup/rollup-linux-x64-musl)
 
-COPY index.html index.tsx App.tsx types.ts tsconfig.json vite.config.ts metadata.json ./
-COPY components ./components
-COPY services ./services
+
+COPY . .
 
 RUN npm run build
+
 
 # =============================================================================
 # Stage 2: Production Full-Stack FastAPI Server (serves /api/* and dist/ at /)
