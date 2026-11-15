@@ -5,6 +5,4 @@ python-dotenv>=1.0.1
 requests>=2.31.0
 pydantic>=2.8.0
 mutagen>=1.47.0
-google-genai>=1.0.0
-git+https://github.com/kokarare1212/librespot-python.git
-git+https://zotify.xyz/zotify/zotify.git
+

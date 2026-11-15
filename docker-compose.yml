@@ -1,40 +1,37 @@
 services:
   yotofy:
+    image: ghcr.io/pdilione/yotofy:latest
     build:
       context: .
       dockerfile: Dockerfile
-    image: yotofy:latest
     container_name: yotofy-stack
     restart: unless-stopped
     ports:
-      - "${UI_PORT:-3000}:3000"   # Vite/React UI (proxies /api/* to FastAPI)
-      - "${API_PORT:-8000}:8000" # FastAPI Python Backend API (backend/sync.py)
+      - "${API_PORT:-8000}:8000"
     env_file:
       - path: .env
         required: false
     environment:
-      - UI_PORT=3000
       - API_PORT=8000
       - AUDIO_DIR=/music
       - DATA_DIR=/data
       - STATE_FILE_PATH=/data/state.json
+      - SPOTIFY_TOKEN_PATH=/data/spotify_token.json
+      - YOTO_TOKEN_PATH=/data/yoto_token.json
       - ZOTIFY_CREDENTIALS_PATH=/data/credentials.json
       - FRONTEND_DIST_DIR=/app/dist
       - SPOTIPY_CLIENT_ID=${SPOTIPY_CLIENT_ID:-}
       - SPOTIPY_CLIENT_SECRET=${SPOTIPY_CLIENT_SECRET:-}
-      - SPOTIPY_USER_ID=${SPOTIPY_USER_ID:-}
-      - SPOTIPY_PLAYLIST_IDS=${SPOTIPY_PLAYLIST_IDS:-}
-      - ZOTIFY_CREDENTIALS_JSON=${ZOTIFY_CREDENTIALS_JSON:-}
+      - YOTO_CLIENT_ID=${YOTO_CLIENT_ID:-}
       - YOTO_ACCESS_TOKEN=${YOTO_ACCESS_TOKEN:-}
       - YOTO_CARD_ID=${YOTO_CARD_ID:-}
     volumes:
-      # Persistent sync history/state (state.json) and Zotify credentials
       - ./data:/data
-      # Persistent local MP3 music library downloaded via Zotify
       - ./music:/music
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8000/api/health && curl -sf http://127.0.0.1:3000/ > /dev/null"]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')\""]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 15s
+

@@ -42,7 +42,9 @@ STATE_FILE_PATH = Path(os.environ.get("STATE_FILE_PATH", str(DATA_DIR / "state.j
 SPOTIFY_TOKEN_PATH = Path(os.environ.get("SPOTIFY_TOKEN_PATH", str(DATA_DIR / "spotify_token.json")))
 YOTO_TOKEN_PATH = Path(os.environ.get("YOTO_TOKEN_PATH", str(DATA_DIR / "yoto_token.json")))
 ZOTIFY_CREDENTIALS_PATH = Path(os.environ.get("ZOTIFY_CREDENTIALS_PATH", str(DATA_DIR / "credentials.json")))
-DIST_DIR = Path(os.environ.get("FRONTEND_DIST_DIR", "dist"))
+ROOT_DIR = Path(__file__).resolve().parent.parent
+_default_dist = ROOT_DIR / "dist" if (ROOT_DIR / "dist").exists() else Path("dist")
+DIST_DIR = Path(os.environ.get("FRONTEND_DIST_DIR", str(_default_dist)))
 
 SPOTIFY_SCOPES = "playlist-read-private playlist-read-collaborative"
 DEFAULT_SPOTIFY_REDIRECT_URI = os.environ.get(
@@ -1419,18 +1421,33 @@ def api_sync(req: SyncRequest, request: Request):
     }
 
 
-# Serve compiled SPA assets if running standalone in production
-if DIST_DIR.exists():
+@app.api_route("/api/{unmatched_path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+def unmatched_api_route(unmatched_path: str):
+    raise HTTPException(status_code=404, detail=f"API route /api/{unmatched_path} not found")
+
+
+class SPAStaticFiles(StaticFiles):
+    """Mounts the compiled Vite dist/ directory at / with a SPA fallback to dist/index.html."""
+
+    async def get_response(self, path: str, scope):
+        try:
+            response = await super().get_response(path, scope)
+            if response.status_code == 404:
+                return FileResponse(str(Path(self.directory) / "index.html"))
+            return response
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code == 404:
+                return FileResponse(str(Path(self.directory) / "index.html"))
+            raise
+
+
+# Serve compiled Vite dist/ folder at / (after all /api/* routes) when dist/ exists
+if DIST_DIR.exists() and (DIST_DIR / "index.html").exists():
     assets_dir = DIST_DIR / "assets"
     if assets_dir.exists():
         app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
-
-    @app.get("/{full_path:path}")
-    def serve_spa(full_path: str):
-        candidate = DIST_DIR / full_path
-        if full_path and candidate.is_file():
-            return FileResponse(str(candidate))
-        return FileResponse(str(DIST_DIR / "index.html"))
+    app.mount("/", SPAStaticFiles(directory=str(DIST_DIR), html=True), name="spa")
 
 
 if __name__ == "__main__":
