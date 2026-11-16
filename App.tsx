@@ -18,6 +18,7 @@ import {
 } from './services/api';
 import { PlaylistCard } from './components/PlaylistCard';
 import { SyncView } from './components/SyncView';
+import { YotoCardDetailView } from './components/YotoCardDetailView';
 import { SettingsView } from './components/SettingsView';
 import { ActivityFeed } from './components/ActivityFeed';
 import { YotoDisplay } from './components/YotoDisplay';
@@ -30,13 +31,16 @@ import {
   Database,
   Hash,
   PlusCircle,
+  ArrowRight,
 } from 'lucide-react';
 
 const App: React.FC = () => {
   const [currentScreen, setCurrentScreen] = useState<ScreenState>('dashboard');
   const [selectedPlaylistId, setSelectedPlaylistId] = useState<string | null>(null);
+  const [selectedYotoCardId, setSelectedYotoCardId] = useState<string | null>(null);
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [yotoCards, setYotoCards] = useState<YotoMyoCard[]>([]);
+
   const [logs, setLogs] = useState<ActivityLog[]>([]);
   const [dashboardView, setDashboardView] = useState<'spotify' | 'yoto'>('spotify');
   const [loading, setLoading] = useState<boolean>(true);
@@ -154,11 +158,43 @@ const App: React.FC = () => {
   }, [loadBackendState]);
 
   const selectedPlaylist = playlists.find((p) => p.id === selectedPlaylistId) || null;
+  const selectedYotoCard =
+    yotoCards.find((c) => c.cardId === selectedYotoCardId) || null;
   const syncedPlaylists = playlists.filter((p) => p.syncConfig?.enabled);
   const totalYotoItemsCount = syncedPlaylists.length + yotoCards.length;
 
   const handlePlaylistSelect = (playlist: Playlist) => {
     setSelectedPlaylistId(playlist.id);
+    setSelectedYotoCardId(null);
+    setCurrentScreen('detail');
+  };
+
+  const handleYotoCardSelect = (card: YotoMyoCard) => {
+    setSelectedYotoCardId(card.cardId);
+    setSelectedPlaylistId(null);
+    setCurrentScreen('yoto_detail');
+  };
+
+  const handleOpenSpotifyPlaylistFromCard = (
+    playlist: Playlist,
+    targetCardId: string
+  ) => {
+    setPlaylists((prev) =>
+      prev.map((p) =>
+        p.id === playlist.id
+          ? {
+              ...p,
+              syncConfig: {
+                enabled: p.syncConfig?.enabled ?? true,
+                lastCheck: p.syncConfig?.lastCheck || 'Just now',
+                targetYotoId: targetCardId,
+              },
+            }
+          : p
+      )
+    );
+    setSelectedPlaylistId(playlist.id);
+    setSelectedYotoCardId(null);
     setCurrentScreen('detail');
   };
 
@@ -167,6 +203,7 @@ const App: React.FC = () => {
       // Clear default yotoCardId so SyncView defaults to '+ Create New Yoto Playlist'
       setSettings((prev) => ({ ...prev, yotoCardId: '' }));
       setSelectedPlaylistId(playlists[0].id);
+      setSelectedYotoCardId(null);
       setCurrentScreen('detail');
     } else {
       setDashboardView('spotify');
@@ -175,8 +212,10 @@ const App: React.FC = () => {
 
   const handleBack = () => {
     setSelectedPlaylistId(null);
+    setSelectedYotoCardId(null);
     setCurrentScreen('dashboard');
   };
+
 
   const handlePlaylistSynced = (
     updatedPlaylist: Playlist,
@@ -464,14 +503,16 @@ const App: React.FC = () => {
                     {yotoCards.map((card) => (
                       <div
                         key={card.cardId}
-                        className="bg-gray-800 rounded-2xl p-4 border border-white/5 hover:border-yoto-orange/50 transition-all shadow-lg flex flex-col justify-between"
+                        onClick={() => handleYotoCardSelect(card)}
+                        className="cursor-pointer group bg-gray-800 rounded-2xl p-4 border border-white/5 hover:border-yoto-orange/60 transition-all hover:-translate-y-1 shadow-lg flex flex-col justify-between"
                       >
-                        <div className="aspect-square mb-4 rounded-xl overflow-hidden bg-black/40 flex items-center justify-center">
-                          {card.coverImageUrl ? (
+                        <div className="aspect-square mb-4 rounded-xl overflow-hidden bg-black/40 flex items-center justify-center relative">
+                          {card.coverImageUrl && card.coverImageUrl.trim() ? (
                             <img
                               src={card.coverImageUrl}
                               alt={card.title}
-                              className="w-full h-full object-cover"
+                              referrerPolicy="no-referrer"
+                              className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
                             />
                           ) : (
                             <YotoDisplay
@@ -482,22 +523,31 @@ const App: React.FC = () => {
                           )}
                         </div>
                         <div>
-                          <h3 className="text-center font-bold text-white text-sm truncate">
+                          <h3 className="text-center font-bold text-white text-sm truncate group-hover:text-yoto-orange transition-colors">
                             {card.title}
                           </h3>
-                          <div className="flex items-center justify-center gap-1.5 mt-2">
-                            <span className="text-[10px] bg-yoto-orange/20 text-yoto-orange px-2 py-0.5 rounded-full font-mono">
-                              {card.cardId}
-                            </span>
+                          <div className="flex items-center justify-center gap-1.5 mt-1.5 text-xs text-gray-400 font-mono tabular-nums">
+                            <span className="text-yoto-orange">{card.cardId}</span>
                             {card.trackCount ? (
-                              <span className="text-[10px] bg-white/10 text-gray-300 px-2 py-0.5 rounded-full">
-                                {card.trackCount} tracks
-                              </span>
+                              <>
+                                <span aria-hidden="true">·</span>
+                                <span>{card.trackCount} tracks</span>
+                              </>
                             ) : null}
+                          </div>
+                          {card.linkedSpotifyPlaylistName && (
+                            <p className="text-[11px] text-emerald-400 text-center truncate mt-1">
+                              Linked: {card.linkedSpotifyPlaylistName}
+                            </p>
+                          )}
+                          <div className="mt-3 pt-2.5 border-t border-white/5 flex items-center justify-center gap-1 text-xs font-semibold text-gray-300 group-hover:text-yoto-orange transition-colors">
+                            <span>View Details &amp; Sync</span>
+                            <ArrowRight size={13} />
                           </div>
                         </div>
                       </div>
                     ))}
+
                   </>
                 )}
               </div>
@@ -597,6 +647,18 @@ const App: React.FC = () => {
           />
         )}
 
+        {currentScreen === 'yoto_detail' && selectedYotoCard && (
+          <YotoCardDetailView
+            card={selectedYotoCard}
+            playlists={playlists}
+            connected={connections.yoto && connections.spotify}
+            settings={settings}
+            onBack={handleBack}
+            onOpenSpotifyPlaylist={handleOpenSpotifyPlaylistFromCard}
+            onCardSynced={handlePlaylistSynced}
+          />
+        )}
+
         {currentScreen === 'settings' && (
           <SettingsView
             settings={settings}
@@ -605,6 +667,7 @@ const App: React.FC = () => {
             onSpotifyConnected={loadBackendState}
           />
         )}
+
       </main>
 
       {/* Footer */}

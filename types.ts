@@ -77,16 +77,46 @@ export interface YotoCardConfig {
   lastSynced?: Date;
 }
 
+export interface YotoCardTrackItem {
+  key: string;
+  title: string;
+  trackUrl?: string;
+  transcodedSha256?: string;
+  duration?: number;
+  fileSize?: number;
+  format?: string;
+  channels?: string;
+  artist?: string;
+  spotifyTrackId?: string;
+}
+
+export interface YotoCardChapterItem {
+  key: string;
+  title: string;
+  duration?: number;
+  fileSize?: number;
+  tracks: YotoCardTrackItem[];
+}
+
 export interface YotoMyoCard {
   cardId: string;
   title: string;
   description?: string;
   coverImageUrl?: string;
   trackCount?: number;
+  chapterCount?: number;
+  totalDuration?: number;
+  playbackType?: string;
   updatedAt?: string;
+  createdAt?: string;
+  chapters?: YotoCardChapterItem[];
+  tracks?: YotoCardTrackItem[];
+  linkedSpotifyPlaylistId?: string;
+  linkedSpotifyPlaylistName?: string;
 }
 
-export type ScreenState = 'dashboard' | 'detail' | 'settings';
+export type ScreenState = 'dashboard' | 'detail' | 'yoto_detail' | 'settings';
+
 
 export type AudioProvider =
   | 'zotify'

@@ -89,14 +89,44 @@ interface ConnectedUserProfile {
   cardCount?: number;
 }
 
+interface YotoCardTrackItem {
+  key: string;
+  title: string;
+  trackUrl?: string;
+  transcodedSha256?: string;
+  duration?: number;
+  fileSize?: number;
+  format?: string;
+  channels?: string;
+  artist?: string;
+  spotifyTrackId?: string;
+}
+
+interface YotoCardChapterItem {
+  key: string;
+  title: string;
+  duration?: number;
+  fileSize?: number;
+  tracks: YotoCardTrackItem[];
+}
+
 interface YotoMyoCard {
   cardId: string;
   title: string;
   description?: string;
   coverImageUrl?: string;
   trackCount?: number;
+  chapterCount?: number;
+  totalDuration?: number;
+  playbackType?: string;
   updatedAt?: string;
+  createdAt?: string;
+  chapters?: YotoCardChapterItem[];
+  tracks?: YotoCardTrackItem[];
+  linkedSpotifyPlaylistId?: string;
+  linkedSpotifyPlaylistName?: string;
 }
+
 
 const DEFAULT_SETTINGS = {
   audioProvider: 'zotify',
@@ -361,7 +391,118 @@ async function getYotoAccessToken(reqClientId?: string): Promise<string | null> 
   return envToken.length > 8 ? envToken : null;
 }
 
-function parseYotoMineCards(raw: Record<string, any>): YotoMyoCard[] {
+function enrichCardWithLocalState(card: YotoMyoCard, state: PersistedState): YotoMyoCard {
+  const shaToTrack: Record<string, { spotifyTrackId: string; title?: string; artist?: string; duration?: number; fileSize?: number }> = {};
+  for (const t of Object.values(state.tracks || {})) {
+    if (t.transcodedSha256) {
+      shaToTrack[t.transcodedSha256] = t;
+    }
+  }
+
+  let linkedPlId: string | undefined;
+  let linkedPlName: string | undefined;
+  for (const pl of Object.values(state.playlists || {})) {
+    if (pl.syncConfig?.targetYotoId === card.cardId) {
+      linkedPlId = pl.id;
+      linkedPlName = pl.name;
+      break;
+    }
+  }
+
+  const enrichedTracks = (card.tracks || []).map((tr) => {
+    const sha = tr.transcodedSha256 || (tr.trackUrl?.startsWith('yoto:#') ? tr.trackUrl.slice(6) : undefined);
+    const matched = sha ? shaToTrack[sha] : undefined;
+    return {
+      ...tr,
+      transcodedSha256: sha,
+      artist: tr.artist || matched?.artist,
+      spotifyTrackId: tr.spotifyTrackId || matched?.spotifyTrackId,
+      duration: tr.duration || matched?.duration,
+      fileSize: tr.fileSize || matched?.fileSize,
+    };
+  });
+
+  return {
+    ...card,
+    tracks: enrichedTracks.length > 0 ? enrichedTracks : card.tracks,
+    trackCount: card.trackCount || (enrichedTracks.length > 0 ? enrichedTracks.length : undefined),
+    linkedSpotifyPlaylistId: card.linkedSpotifyPlaylistId || linkedPlId,
+    linkedSpotifyPlaylistName: card.linkedSpotifyPlaylistName || linkedPlName,
+  };
+}
+
+function parseSingleYotoCard(item: Record<string, any>, state?: PersistedState): YotoMyoCard {
+  const raw = (item.card && typeof item.card === 'object' ? item.card : item) as Record<string, any>;
+  const cardId = String(raw.cardId || raw.id || raw._id || '');
+  const metadata = (raw.metadata || {}) as Record<string, any>;
+  const content = (raw.content || {}) as Record<string, any>;
+  const rawChapters = Array.isArray(content.chapters) ? content.chapters : [];
+
+  const chapters: YotoCardChapterItem[] = [];
+  const flatTracks: YotoCardTrackItem[] = [];
+  let totalDuration = 0;
+
+  for (let cIdx = 0; cIdx < rawChapters.length; cIdx++) {
+    const ch = rawChapters[cIdx] as Record<string, any>;
+    if (!ch || typeof ch !== 'object') continue;
+    const rawTracks = Array.isArray(ch.tracks) ? ch.tracks : [];
+    const parsedChTracks: YotoCardTrackItem[] = rawTracks
+      .filter((t: any) => t && typeof t === 'object')
+      .map((t: Record<string, any>, tIdx: number) => {
+        const trackUrl = t.trackUrl ? String(t.trackUrl) : undefined;
+        const sha = trackUrl?.startsWith('yoto:#') ? trackUrl.slice(6) : undefined;
+        const dur = typeof t.duration === 'number' ? t.duration : undefined;
+        if (dur) totalDuration += dur;
+        const itemTrack: YotoCardTrackItem = {
+          key: String(t.key || String(tIdx + 1).padStart(2, '0')),
+          title: String(t.title || ch.title || `Track ${tIdx + 1}`),
+          trackUrl,
+          transcodedSha256: sha,
+          duration: dur,
+          fileSize: typeof t.fileSize === 'number' ? t.fileSize : undefined,
+          format: t.format ? String(t.format) : undefined,
+          channels: t.channels ? String(t.channels) : undefined,
+        };
+        flatTracks.push(itemTrack);
+        return itemTrack;
+      });
+
+    chapters.push({
+      key: String(ch.key || String(cIdx + 1).padStart(2, '0')),
+      title: String(ch.title || `Chapter ${cIdx + 1}`),
+      duration: typeof ch.duration === 'number' ? ch.duration : undefined,
+      fileSize: typeof ch.fileSize === 'number' ? ch.fileSize : undefined,
+      tracks: parsedChTracks,
+    });
+  }
+
+  const mediaDuration = typeof metadata.media?.duration === 'number' ? metadata.media.duration : undefined;
+  const cover =
+    metadata.cover?.imageL ||
+    metadata.cover?.imageM ||
+    metadata.cover?.imageS ||
+    raw.coverImageUrl ||
+    undefined;
+
+  const baseCard: YotoMyoCard = {
+    cardId,
+    title: String(raw.title || metadata.title || `MYO Card ${cardId}`),
+    description: metadata.description ? String(metadata.description) : raw.description ? String(raw.description) : undefined,
+    coverImageUrl: cover,
+    trackCount: flatTracks.length || raw.trackCount || chapters.length || undefined,
+    chapterCount: chapters.length || raw.chapterCount || undefined,
+    totalDuration: totalDuration || mediaDuration || raw.totalDuration || undefined,
+    playbackType: content.playbackType ? String(content.playbackType) : raw.playbackType ? String(raw.playbackType) : undefined,
+    updatedAt: raw.updatedAt ? String(raw.updatedAt) : undefined,
+    createdAt: raw.createdAt ? String(raw.createdAt) : undefined,
+    chapters: chapters.length > 0 ? chapters : Array.isArray(raw.chapters) ? raw.chapters : undefined,
+    tracks: flatTracks.length > 0 ? flatTracks : Array.isArray(raw.tracks) ? raw.tracks : undefined,
+  };
+
+  return state ? enrichCardWithLocalState(baseCard, state) : baseCard;
+}
+
+function parseYotoMineCards(raw: Record<string, any>, state?: PersistedState): YotoMyoCard[] {
   const rawList = Array.isArray(raw)
     ? raw
     : Array.isArray(raw.cards)
@@ -372,32 +513,7 @@ function parseYotoMineCards(raw: Record<string, any>): YotoMyoCard[] {
 
   return rawList
     .filter((item: any) => item && (item.cardId || item.id || item._id))
-    .map((item: Record<string, any>) => {
-      const cardId = String(item.cardId || item.id || item._id);
-      const metadata = (item.metadata || {}) as Record<string, any>;
-      const content = (item.content || {}) as Record<string, any>;
-      const chapters = Array.isArray(content.chapters) ? content.chapters : [];
-      let trackCount = 0;
-      for (const ch of chapters) {
-        if (Array.isArray(ch?.tracks)) {
-          trackCount += ch.tracks.length;
-        }
-      }
-      const cover =
-        metadata.cover?.imageL ||
-        metadata.cover?.imageM ||
-        metadata.cover?.imageS ||
-        item.coverImageUrl ||
-        undefined;
-      return {
-        cardId,
-        title: String(item.title || metadata.title || `MYO Card ${cardId}`),
-        description: metadata.description ? String(metadata.description) : undefined,
-        coverImageUrl: cover,
-        trackCount: trackCount || chapters.length || undefined,
-        updatedAt: item.updatedAt ? String(item.updatedAt) : undefined,
-      };
-    });
+    .map((item: Record<string, any>) => parseSingleYotoCard(item, state));
 }
 
 async function verifyYotoConnectionViaMine(reqClientId?: string): Promise<{
@@ -406,11 +522,28 @@ async function verifyYotoConnectionViaMine(reqClientId?: string): Promise<{
   cards: YotoMyoCard[];
 }> {
   const token = await getYotoAccessToken(reqClientId);
-  if (!token) {
-    return { verified: false, profile: null, cards: [] };
-  }
-
   const tokenData = loadJsonFile<Record<string, any>>(YOTO_TOKEN_FILE) || {};
+  const state = loadState();
+  const cachedCards: YotoMyoCard[] = Array.isArray(tokenData.cards)
+    ? tokenData.cards.map((c: Record<string, any>) => parseSingleYotoCard(c, state))
+    : [];
+  const cachedProfile: ConnectedUserProfile | null =
+    tokenData.user || tokenData.profile || (cachedCards.length > 0
+      ? {
+          id: 'yoto-user',
+          display_name: `Yoto Library (${cachedCards.length} MYO Cards)`,
+          avatar: null,
+          cardCount: cachedCards.length,
+        }
+      : null);
+
+  if (!token) {
+    return {
+      verified: cachedCards.length > 0,
+      profile: cachedProfile,
+      cards: cachedCards,
+    };
+  }
 
   try {
     const mineResp = await fetch(`${YOTO_API_BASE}/content/mine`, {
@@ -422,11 +555,14 @@ async function verifyYotoConnectionViaMine(reqClientId?: string): Promise<{
     });
 
     if (!mineResp.ok) {
+      if (cachedCards.length > 0) {
+        return { verified: true, profile: cachedProfile, cards: cachedCards };
+      }
       return { verified: false, profile: null, cards: [] };
     }
 
     const mineJson = (await mineResp.json()) as Record<string, any>;
-    const cards = parseYotoMineCards(mineJson);
+    const cards = parseYotoMineCards(mineJson, state);
 
     let displayName = tokenData.user?.display_name || '';
     let avatar: string | null = tokenData.user?.avatar || null;
@@ -467,9 +603,13 @@ async function verifyYotoConnectionViaMine(reqClientId?: string): Promise<{
     return { verified: true, profile, cards };
   } catch (err) {
     console.error('Failed to verify Yoto connection via /content/mine:', err);
+    if (cachedCards.length > 0) {
+      return { verified: true, profile: cachedProfile, cards: cachedCards };
+    }
     return { verified: false, profile: null, cards: [] };
   }
 }
+
 
 function formatDurationMs(ms: number): string {
   const totalSec = Math.max(0, Math.round((ms || 0) / 1000));
@@ -973,10 +1113,62 @@ async function startServer() {
     return res.json(playlists);
   });
 
+  app.get('/api/yoto/cards/:cardId', async (req, res) => {
+    const { cardId } = req.params;
+    const reqYotoClientId = extractRequestYotoClientId(req);
+    const state = loadState();
+    const tokenData = loadJsonFile<Record<string, any>>(YOTO_TOKEN_FILE) || {};
+    const cachedList: Record<string, any>[] = Array.isArray(tokenData.cards) ? tokenData.cards : [];
+    const cachedRaw = cachedList.find((c) => String(c.cardId || c.id || c._id) === cardId);
+
+    const token = await getYotoAccessToken(reqYotoClientId);
+    if (token) {
+      try {
+        const detailResp = await fetch(`${YOTO_API_BASE}/content/${encodeURIComponent(cardId)}`, {
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            Accept: 'application/json',
+          },
+        });
+        if (detailResp.ok) {
+          const detailJson = (await detailResp.json()) as Record<string, any>;
+          const parsed = parseSingleYotoCard(
+            {
+              ...(cachedRaw || {}),
+              ...(detailJson.card || detailJson),
+              cardId,
+            },
+            state
+          );
+          return res.json({ card: parsed });
+        }
+      } catch (err) {
+        console.error(`Failed to fetch /content/${cardId}:`, err);
+      }
+    }
+
+    if (cachedRaw) {
+      const parsed = parseSingleYotoCard(cachedRaw, state);
+      return res.json({ card: parsed });
+    }
+
+    return res.json({
+      card: enrichCardWithLocalState(
+        {
+          cardId,
+          title: `MYO Card ${cardId}`,
+        },
+        state
+      ),
+    });
+  });
+
   app.get('/api/activity', (_req, res) => {
     const state = loadState();
     res.json(state.activity);
   });
+
 
   app.post('/api/settings', (req, res) => {
     const reqSpClientId = extractRequestSpotifyClientId(req);

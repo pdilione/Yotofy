@@ -318,6 +318,19 @@ export const getPlaylists = async (): Promise<Playlist[]> => {
   return Array.isArray(data) ? data : Array.isArray(data?.playlists) ? data.playlists : [];
 };
 
+export const getYotoCardDetail = async (cardId: string): Promise<YotoMyoCard> => {
+  const response = await fetch(`/api/yoto/cards/${encodeURIComponent(cardId)}`, {
+    method: 'GET',
+    headers: buildApiHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Yoto card details (${response.status})`);
+  }
+  const data = await response.json();
+  return (data?.card || data) as YotoMyoCard;
+};
+
+
 export const getActivity = async (): Promise<ActivityLog[]> => {
   const response = await fetch('/api/activity', {
     method: 'GET',

@@ -399,7 +399,124 @@ def get_yoto_token(override_client_id: Optional[str] = None) -> Optional[str]:
     return access_token.strip() if isinstance(access_token, str) and access_token.strip() else None
 
 
-def parse_yoto_mine_cards(raw: Any) -> List[Dict[str, Any]]:
+def enrich_card_with_local_state(card: Dict[str, Any], state: Dict[str, Any]) -> Dict[str, Any]:
+    sha_to_track: Dict[str, Dict[str, Any]] = {}
+    for t in (state.get("tracks") or {}).values():
+        if isinstance(t, dict) and t.get("transcodedSha256"):
+            sha_to_track[str(t["transcodedSha256"])] = t
+
+    linked_pl_id: Optional[str] = None
+    linked_pl_name: Optional[str] = None
+    for pl in (state.get("playlists") or {}).values():
+        if isinstance(pl, dict) and (pl.get("syncConfig") or {}).get("targetYotoId") == card.get("cardId"):
+            linked_pl_id = pl.get("id")
+            linked_pl_name = pl.get("name")
+            break
+
+    enriched_tracks: List[Dict[str, Any]] = []
+    for tr in card.get("tracks") or []:
+        if not isinstance(tr, dict):
+            continue
+        track_url = str(tr.get("trackUrl") or "")
+        sha = tr.get("transcodedSha256") or (track_url[6:] if track_url.startswith("yoto:#") else None)
+        matched = sha_to_track.get(sha) if sha else None
+        enriched_tracks.append(
+            {
+                **tr,
+                "transcodedSha256": sha,
+                "artist": tr.get("artist") or (matched.get("artist") if matched else None),
+                "spotifyTrackId": tr.get("spotifyTrackId") or (matched.get("spotifyTrackId") if matched else None),
+                "duration": tr.get("duration") or (matched.get("duration") if matched else None),
+                "fileSize": tr.get("fileSize") or (matched.get("fileSize") if matched else None),
+            }
+        )
+
+    out = dict(card)
+    if enriched_tracks:
+        out["tracks"] = enriched_tracks
+        out["trackCount"] = out.get("trackCount") or len(enriched_tracks)
+    if linked_pl_id and not out.get("linkedSpotifyPlaylistId"):
+        out["linkedSpotifyPlaylistId"] = linked_pl_id
+    if linked_pl_name and not out.get("linkedSpotifyPlaylistName"):
+        out["linkedSpotifyPlaylistName"] = linked_pl_name
+    return out
+
+
+def parse_single_yoto_card(item: Dict[str, Any], state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    raw = item.get("card") if isinstance(item.get("card"), dict) else item
+    card_id = str(raw.get("cardId") or raw.get("id") or raw.get("_id") or "")
+    metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+    content = raw.get("content") if isinstance(raw.get("content"), dict) else {}
+    raw_chapters = content.get("chapters") if isinstance(content.get("chapters"), list) else []
+
+    chapters: List[Dict[str, Any]] = []
+    flat_tracks: List[Dict[str, Any]] = []
+    total_duration = 0
+
+    for c_idx, ch in enumerate(raw_chapters, start=1):
+        if not isinstance(ch, dict):
+            continue
+        raw_tracks = ch.get("tracks") if isinstance(ch.get("tracks"), list) else []
+        parsed_ch_tracks: List[Dict[str, Any]] = []
+        for t_idx, t in enumerate(raw_tracks, start=1):
+            if not isinstance(t, dict):
+                continue
+            track_url = str(t.get("trackUrl")) if t.get("trackUrl") else None
+            sha = track_url[6:] if track_url and track_url.startswith("yoto:#") else None
+            dur = t.get("duration") if isinstance(t.get("duration"), (int, float)) else None
+            if dur:
+                total_duration += int(dur)
+            tr_obj = {
+                "key": str(t.get("key") or f"{t_idx:02d}"),
+                "title": str(t.get("title") or ch.get("title") or f"Track {t_idx}"),
+                "trackUrl": track_url,
+                "transcodedSha256": sha,
+                "duration": int(dur) if dur is not None else None,
+                "fileSize": int(t["fileSize"]) if isinstance(t.get("fileSize"), (int, float)) else None,
+                "format": str(t["format"]) if t.get("format") else None,
+                "channels": str(t["channels"]) if t.get("channels") else None,
+            }
+            parsed_ch_tracks.append(tr_obj)
+            flat_tracks.append(tr_obj)
+
+        chapters.append(
+            {
+                "key": str(ch.get("key") or f"{c_idx:02d}"),
+                "title": str(ch.get("title") or f"Chapter {c_idx}"),
+                "duration": int(ch["duration"]) if isinstance(ch.get("duration"), (int, float)) else None,
+                "fileSize": int(ch["fileSize"]) if isinstance(ch.get("fileSize"), (int, float)) else None,
+                "tracks": parsed_ch_tracks,
+            }
+        )
+
+    cover_obj = metadata.get("cover") if isinstance(metadata.get("cover"), dict) else {}
+    cover_url = (
+        cover_obj.get("imageL")
+        or cover_obj.get("imageM")
+        or cover_obj.get("imageS")
+        or raw.get("coverImageUrl")
+    )
+    media_obj = metadata.get("media") if isinstance(metadata.get("media"), dict) else {}
+    media_duration = int(media_obj["duration"]) if isinstance(media_obj.get("duration"), (int, float)) else None
+
+    base_card: Dict[str, Any] = {
+        "cardId": card_id,
+        "title": str(raw.get("title") or metadata.get("title") or f"MYO Card {card_id}"),
+        "description": metadata.get("description") or raw.get("description"),
+        "coverImageUrl": cover_url,
+        "trackCount": len(flat_tracks) or raw.get("trackCount") or len(chapters) or None,
+        "chapterCount": len(chapters) or raw.get("chapterCount") or None,
+        "totalDuration": total_duration or media_duration or raw.get("totalDuration") or None,
+        "playbackType": content.get("playbackType") or raw.get("playbackType"),
+        "updatedAt": raw.get("updatedAt"),
+        "createdAt": raw.get("createdAt"),
+        "chapters": chapters if chapters else (raw.get("chapters") if isinstance(raw.get("chapters"), list) else None),
+        "tracks": flat_tracks if flat_tracks else (raw.get("tracks") if isinstance(raw.get("tracks"), list) else None),
+    }
+    return enrich_card_with_local_state(base_card, state) if state else base_card
+
+
+def parse_yoto_mine_cards(raw: Any, state: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
     raw_list: List[Any] = []
     if isinstance(raw, list):
         raw_list = raw
@@ -416,30 +533,7 @@ def parse_yoto_mine_cards(raw: Any) -> List[Dict[str, Any]]:
         card_id = item.get("cardId") or item.get("id") or item.get("_id")
         if not card_id:
             continue
-        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
-        content = item.get("content") if isinstance(item.get("content"), dict) else {}
-        chapters = content.get("chapters") if isinstance(content.get("chapters"), list) else []
-        track_count = 0
-        for ch in chapters:
-            if isinstance(ch, dict) and isinstance(ch.get("tracks"), list):
-                track_count += len(ch["tracks"])
-        cover_obj = metadata.get("cover") if isinstance(metadata.get("cover"), dict) else {}
-        cover_url = (
-            cover_obj.get("imageL")
-            or cover_obj.get("imageM")
-            or cover_obj.get("imageS")
-            or item.get("coverImageUrl")
-        )
-        cards_out.append(
-            {
-                "cardId": str(card_id),
-                "title": str(item.get("title") or metadata.get("title") or f"MYO Card {card_id}"),
-                "description": metadata.get("description"),
-                "coverImageUrl": cover_url,
-                "trackCount": track_count or len(chapters) or None,
-                "updatedAt": item.get("updatedAt"),
-            }
-        )
+        cards_out.append(parse_single_yoto_card(item, state))
     return cards_out
 
 
@@ -447,10 +541,35 @@ def verify_yoto_connection_via_mine(
     override_client_id: Optional[str] = None,
 ) -> tuple[bool, Optional[Dict[str, Any]], List[Dict[str, Any]]]:
     access_token = get_yoto_token(override_client_id)
-    if not access_token:
-        return False, None, []
-
     token_data = load_yoto_token_data() or {}
+    state = store.load()
+    cached_cards: List[Dict[str, Any]] = [
+        parse_single_yoto_card(c, state)
+        for c in (token_data.get("cards") or [])
+        if isinstance(c, dict)
+    ]
+    cached_profile: Optional[Dict[str, Any]] = (
+        token_data.get("profile")
+        if isinstance(token_data.get("profile"), dict)
+        else (
+            token_data.get("user")
+            if isinstance(token_data.get("user"), dict)
+            else (
+                {
+                    "id": "yoto-user",
+                    "display_name": f"Yoto Library ({len(cached_cards)} MYO Cards)",
+                    "avatar": None,
+                    "cardCount": len(cached_cards),
+                }
+                if cached_cards
+                else None
+            )
+        )
+    )
+
+    if not access_token:
+        return bool(cached_cards), cached_profile, cached_cards
+
     try:
         resp = requests.get(
             f"{YOTO_API_BASE}/content/mine",
@@ -458,10 +577,12 @@ def verify_yoto_connection_via_mine(
             timeout=15,
         )
         if resp.status_code != 200:
+            if cached_cards:
+                return True, cached_profile, cached_cards
             return False, None, []
 
         mine_json = resp.json()
-        cards = parse_yoto_mine_cards(mine_json)
+        cards = parse_yoto_mine_cards(mine_json, state)
 
         profile = token_data.get("profile") if isinstance(token_data.get("profile"), dict) else {}
         display_name = profile.get("display_name") or ""
@@ -505,7 +626,10 @@ def verify_yoto_connection_via_mine(
         return True, user_profile, cards
     except Exception as exc:
         logger.warning(f"Failed to verify Yoto connection via /content/mine: {exc}")
+        if cached_cards:
+            return True, cached_profile, cached_cards
         return False, None, []
+
 
 
 def format_duration_ms(duration_ms: int) -> str:
@@ -1217,7 +1341,50 @@ def api_playlists(request: Request):
     return playlists_out
 
 
+@app.get("/api/yoto/cards/{card_id}")
+def api_yoto_card_detail(card_id: str, request: Request):
+    req_yoto_client_id = extract_request_yoto_client_id(request)
+    state = store.load()
+    token_data = load_yoto_token_data() or {}
+    cached_list = token_data.get("cards") if isinstance(token_data.get("cards"), list) else []
+    cached_raw = next(
+        (
+            c
+            for c in cached_list
+            if isinstance(c, dict) and str(c.get("cardId") or c.get("id") or c.get("_id")) == card_id
+        ),
+        None,
+    )
+
+    access_token = get_yoto_token(req_yoto_client_id)
+    if access_token:
+        try:
+            resp = requests.get(
+                f"{YOTO_API_BASE}/content/{card_id}",
+                headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                detail_json = resp.json()
+                raw_payload = detail_json.get("card") if isinstance(detail_json.get("card"), dict) else detail_json
+                merged = {**(cached_raw or {}), **(raw_payload if isinstance(raw_payload, dict) else {}), "cardId": card_id}
+                return {"card": parse_single_yoto_card(merged, state)}
+        except Exception as exc:
+            logger.warning(f"Failed to fetch /content/{card_id}: {exc}")
+
+    if cached_raw:
+        return {"card": parse_single_yoto_card(cached_raw, state)}
+
+    return {
+        "card": enrich_card_with_local_state(
+            {"cardId": card_id, "title": f"MYO Card {card_id}"},
+            state,
+        )
+    }
+
+
 @app.get("/api/activity")
+
 def api_activity():
     state = store.load()
     return state.get("activity", [])
