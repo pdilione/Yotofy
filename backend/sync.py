@@ -613,6 +613,7 @@ def download_track_with_zotify(track_id: str, track_title: str, creds_path: Opti
     tmp_dir = AUDIO_DIR / f"_tmp_{track_id}"
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     credentials_file = str(creds_path or ZOTIFY_CREDENTIALS_PATH)
     cmd = [
@@ -620,23 +621,38 @@ def download_track_with_zotify(track_id: str, track_title: str, creds_path: Opti
         "-m",
         "zotify",
         f"https://open.spotify.com/track/{track_id}",
-        "--credentials",
+        "--config-location",
+        str(DATA_DIR),
+        "--credentials-location",
         credentials_file,
-        "--library",
+        "--root-path",
         str(tmp_dir),
         "--output",
-        "{song_name}.{ext}",
-        "--audio-format",
+        "{song_name}",
+        "--download-format",
         "mp3",
         "--download-quality",
         "very_high",
+        "--lyrics-to-file",
+        "False",
+        "--lyrics-to-metadata",
+        "False",
+        "--disable-song-archive",
+        "True",
+        "--disable-directory-archives",
+        "True",
+        "--skip-previously-downloaded",
+        "False",
+        "--standard-interface",
+        "True",
     ]
 
-    logger.info(f"Downloading '{track_title}' ({track_id}) via Zotify...")
+    logger.info(f"Downloading '{track_title}' ({track_id}) via Googolplexed0/zotify...")
     try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+        env = {**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, check=False)
         if res.returncode != 0:
-            logger.warning(f"Zotify exited with {res.returncode}: {res.stderr.strip()}")
+            logger.warning(f"Zotify exited with {res.returncode}: {(res.stderr or res.stdout).strip()}")
         mp3_files = [Path(p) for p in glob.glob(str(tmp_dir / "**" / "*.mp3"), recursive=True)]
         if not mp3_files:
             return None
@@ -647,6 +663,7 @@ def download_track_with_zotify(track_id: str, track_title: str, creds_path: Opti
         return None
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 
 class YotoClient:

@@ -9,11 +9,9 @@ COPY package.json package-lock.json* ./
 RUN npm ci --include=optional && \
     ([ -d node_modules/@rollup/rollup-linux-x64-musl ] || npm install --no-save @rollup/rollup-linux-x64-musl)
 
-
 COPY . .
 
 RUN npm run build
-
 
 # =============================================================================
 # Stage 2: Production Full-Stack FastAPI Server (serves /api/* and dist/ at /)
@@ -29,12 +27,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 COPY backend/requirements.txt ./backend/requirements.txt
-RUN pip install --no-cache-dir -r backend/requirements.txt
-
-RUN mkdir -p /app/data /music && \
-    pip install --no-cache-dir music-tag pkce pwinput tabulate ffmpy tqdm pillow requests "git+https://github.com/kokarare1212/librespot-python" && \
-    pip install --no-cache-dir --no-deps "https://github.com/zotify-dev/zotify/archive/refs/heads/v1.0-dev.zip" && \
-    python -c 'p="/usr/local/lib/python3.12/site-packages/zotify/playable.py"; s=open(p).read(); open(p,"w").write("from librespot.audio import LoadedStream\n" + s.replace("PlayableContentFeeder.LoadedStream", "LoadedStream"))' && \
+RUN pip install --no-cache-dir -r backend/requirements.txt && \
+    mkdir -p /app/data /music && \
     ln -sfn /app/data /data
 
 COPY backend ./backend
@@ -44,6 +38,7 @@ VOLUME ["/app/data", "/music"]
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python \
     API_PORT=8000 \
     AUDIO_DIR=/music \
     DATA_DIR=/app/data \
@@ -56,4 +51,3 @@ ENV PYTHONUNBUFFERED=1 \
 EXPOSE 8000
 
 CMD ["uvicorn", "backend.sync:app", "--host", "0.0.0.0", "--port", "8000"]
-
