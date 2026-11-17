@@ -7,10 +7,15 @@ import uuid
 import shutil
 import logging
 import subprocess
+import hashlib
+import base64
+import secrets
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse, parse_qs
 
 import requests
 import spotipy
@@ -42,11 +47,53 @@ STATE_FILE_PATH = Path(os.environ.get("STATE_FILE_PATH", str(DATA_DIR / "state.j
 SPOTIFY_TOKEN_PATH = Path(os.environ.get("SPOTIFY_TOKEN_PATH", str(DATA_DIR / "spotify_token.json")))
 YOTO_TOKEN_PATH = Path(os.environ.get("YOTO_TOKEN_PATH", str(DATA_DIR / "yoto_token.json")))
 ZOTIFY_CREDENTIALS_PATH = Path(os.environ.get("ZOTIFY_CREDENTIALS_PATH", "/app/data/credentials.json"))
+LOG_FILE_PATH = Path(os.environ.get("LOG_FILE_PATH", str(DATA_DIR / "yotofy.log")))
 ROOT_DIR = Path(__file__).resolve().parent.parent
 _default_dist = ROOT_DIR / "dist" if (ROOT_DIR / "dist").exists() else Path("dist")
 DIST_DIR = Path(os.environ.get("FRONTEND_DIST_DIR", str(_default_dist)))
 
-SPOTIFY_SCOPES = "playlist-read-private playlist-read-collaborative"
+SYSTEM_LOG_BUFFER: List[Dict[str, Any]] = []
+
+
+class SystemLogBufferHandler(logging.Handler):
+    """Captures all backend log records into an in-memory ring buffer and appends to /app/data/yotofy.log."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            ts = datetime.now(timezone.utc).isoformat()
+            msg = record.getMessage()
+            details = getattr(record, "details", None)
+            entry: Dict[str, Any] = {
+                "id": uuid.uuid4().hex[:10],
+                "timestamp": ts,
+                "level": record.levelname,
+                "logger": record.name,
+                "message": msg,
+            }
+            if details:
+                entry["details"] = str(details)
+            SYSTEM_LOG_BUFFER.insert(0, entry)
+            del SYSTEM_LOG_BUFFER[300:]
+
+            LOG_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with LOG_FILE_PATH.open("a", encoding="utf-8") as f:
+                f.write(f"{ts} [{record.levelname}] {record.name}: {msg}\n")
+                if details:
+                    for line in str(details).splitlines():
+                        f.write(f"    {line}\n")
+        except Exception:
+            pass
+
+
+_buffer_handler = SystemLogBufferHandler()
+logger.addHandler(_buffer_handler)
+
+
+SPOTIFY_SCOPES = (
+    "streaming playlist-read-private playlist-read-collaborative "
+    "user-follow-read user-read-playback-position user-top-read "
+    "user-read-recently-played user-library-read user-read-email user-read-private"
+)
 DEFAULT_SPOTIFY_REDIRECT_URI = os.environ.get(
     "SPOTIPY_REDIRECT_URI",
     "http://127.0.0.1:8000/api/auth/spotify/callback",
@@ -714,32 +761,239 @@ def build_playlist_payload(raw_pl: Dict[str, Any], sp: spotipy.Spotify, state: D
     return result
 
 
+ZOTIFY_KEYMASTER_CLIENT_ID = "65b708073fc0480ea92a077233ca87bd"
+ZOTIFY_KEYMASTER_REDIRECT_URI = "http://127.0.0.1:4381/login"
+ZOTIFY_KEYMASTER_SCOPES = (
+    "streaming playlist-read-private playlist-read-collaborative "
+    "user-follow-read user-read-playback-position user-top-read "
+    "user-read-recently-played user-library-read user-read-email user-read-private"
+)
+ZOTIFY_PKCE_STATE_PATH = DATA_DIR / "zotify_pkce.json"
+_LAST_ZOTIFY_CODE_VERIFIER: Optional[str] = None
+
+
+def inspect_and_normalize_zotify_credentials(path: Path) -> Dict[str, Any]:
+    """
+    Validates a Zotify Login5 credentials.json file and automatically upgrades
+    legacy librespot keys ('auth_data' / 'auth_type') to Googolplexed0/zotify's
+    required keys ('credentials' / 'type').
+    """
+    exists = path.exists() and path.is_file()
+    size = path.stat().st_size if exists else 0
+    if not exists or size == 0:
+        return {
+            "exists": exists,
+            "valid": False,
+            "path": str(path),
+            "size": size,
+            "error": "Credentials file is missing or empty (0 bytes).",
+        }
+
+    try:
+        raw_text = path.read_text(encoding="utf-8", errors="replace").strip()
+        data = json.loads(raw_text)
+        if not isinstance(data, dict):
+            return {
+                "exists": True,
+                "valid": False,
+                "path": str(path),
+                "size": size,
+                "error": "Credentials file is not a JSON object.",
+            }
+
+        changed = False
+        if not data.get("credentials") and data.get("auth_data"):
+            data["credentials"] = data["auth_data"]
+            changed = True
+
+        cred_type = data.get("type") or data.get("auth_type")
+        if cred_type in (4, "4", "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS", None) and data.get("credentials"):
+            if data.get("type") != "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS":
+                data["type"] = "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS"
+                changed = True
+
+        if changed:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+            size = path.stat().st_size
+
+        username = str(data.get("username") or "").strip()
+        credentials_b64 = str(data.get("credentials") or "").strip()
+        final_type = str(data.get("type") or "").strip()
+
+        if final_type == "OAUTH_PKCE_TOKEN" and data.get("access_token"):
+            return {
+                "exists": True,
+                "valid": True,
+                "username": username or "OAuth PKCE Token",
+                "type": final_type,
+                "path": str(path),
+                "size": size,
+            }
+
+        if not username or not credentials_b64 or final_type != "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS":
+            return {
+                "exists": True,
+                "valid": False,
+                "path": str(path),
+                "size": size,
+                "error": (
+                    "Invalid Zotify credentials format: expected keys "
+                    "'username', 'credentials', and 'type': 'AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS'."
+                ),
+            }
+
+        return {
+            "exists": True,
+            "valid": True,
+            "username": username,
+            "type": final_type,
+            "path": str(path),
+            "size": size,
+        }
+    except Exception as exc:
+        return {
+            "exists": True,
+            "valid": False,
+            "path": str(path),
+            "size": size,
+            "error": f"Failed to parse credentials.json: {exc}",
+        }
+
+
+def bootstrap_zotify_login5_from_access_token(access_token: str, target_path: Path) -> Dict[str, Any]:
+    """
+    Uses Googolplexed0/librespot-python in a clean subprocess to exchange a Spotify
+    OAuth access_token for reusable Login5 AP credentials and saves them to target_path.
+    """
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    helper_code = (
+        "import json, os, sys\n"
+        "from librespot.core import Session\n"
+        "from librespot.proto import Authentication_pb2 as Authentication\n"
+        "token = os.environ['ZOTIFY_BOOT_TOKEN']\n"
+        "out_path = os.environ['ZOTIFY_BOOT_OUT']\n"
+        "builder = Session.Builder()\n"
+        "builder.conf.store_credentials = False\n"
+        "builder.login_credentials = Authentication.LoginCredentials(\n"
+        "    typ=Authentication.AuthenticationType.AUTHENTICATION_SPOTIFY_TOKEN,\n"
+        "    auth_data=token.encode('utf-8')\n"
+        ")\n"
+        "session = builder.create()\n"
+        "creds = session.credentials()\n"
+        "with open(out_path, 'w', encoding='utf-8') as f:\n"
+        "    json.dump(creds, f, indent=2)\n"
+        "print(json.dumps({'username': creds.get('username'), 'type': creds.get('type')}))\n"
+        "sys.stdout.flush()\n"
+        "os._exit(0)\n"
+    )
+    env = {
+        **os.environ,
+        "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python",
+        "ZOTIFY_BOOT_TOKEN": access_token,
+        "ZOTIFY_BOOT_OUT": str(target_path),
+    }
+    res = subprocess.run(
+        [sys.executable, "-c", helper_code],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+        timeout=30,
+        check=False,
+    )
+    if res.returncode != 0:
+        err_out = (res.stderr or res.stdout or "").strip()
+        raise RuntimeError(f"librespot Session.Builder().create() failed (exit={res.returncode}): {err_out}")
+    status = inspect_and_normalize_zotify_credentials(target_path)
+    if not status.get("valid"):
+        raise RuntimeError(status.get("error") or "Generated credentials.json failed validation.")
+    return status
+
+
 def prepare_zotify_credentials() -> Path:
     creds_json = os.environ.get("ZOTIFY_CREDENTIALS_JSON")
-    if creds_json:
+    if creds_json and creds_json.strip():
         ZOTIFY_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        ZOTIFY_CREDENTIALS_PATH.write_text(creds_json, encoding="utf-8")
+        ZOTIFY_CREDENTIALS_PATH.write_text(creds_json.strip(), encoding="utf-8")
+        inspect_and_normalize_zotify_credentials(ZOTIFY_CREDENTIALS_PATH)
         return ZOTIFY_CREDENTIALS_PATH
-    if ZOTIFY_CREDENTIALS_PATH.exists():
-        return ZOTIFY_CREDENTIALS_PATH
-    fallback_creds = DATA_DIR / "credentials.json"
-    if fallback_creds.exists():
-        return fallback_creds
+
+    candidate_paths = [
+        ZOTIFY_CREDENTIALS_PATH,
+        DATA_DIR / "credentials.json",
+        Path("/data/credentials.json"),
+        Path.home() / ".config" / "zotify" / "credentials.json",
+        Path.home() / ".local" / "share" / "zotify" / "credentials.json",
+    ]
+    for cand in candidate_paths:
+        try:
+            info = inspect_and_normalize_zotify_credentials(cand)
+            if info.get("valid"):
+                if cand.resolve() != ZOTIFY_CREDENTIALS_PATH.resolve():
+                    ZOTIFY_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(str(cand), str(ZOTIFY_CREDENTIALS_PATH))
+                return ZOTIFY_CREDENTIALS_PATH
+        except Exception:
+            continue
+
+    # Programmatic fallback: if credentials.json is still missing/invalid and spotify_token.json exists,
+    # attempt to exchange the active Spotify OAuth access_token for a reusable Login5 session automatically.
+    if SPOTIFY_TOKEN_PATH.exists():
+        try:
+            tok_data = json.loads(SPOTIFY_TOKEN_PATH.read_text(encoding="utf-8"))
+            acc_tok = tok_data.get("access_token")
+            if acc_tok:
+                bootstrap_zotify_login5_from_access_token(acc_tok, ZOTIFY_CREDENTIALS_PATH)
+                logger.info(
+                    f"Auto-provisioned {ZOTIFY_CREDENTIALS_PATH} from existing Spotify OAuth token."
+                )
+        except Exception as exc:
+            logger.debug(f"Auto-bootstrap from spotify_token.json skipped: {exc}")
+
     return ZOTIFY_CREDENTIALS_PATH
 
 
-def download_track_with_zotify(track_id: str, track_title: str, creds_path: Optional[Path] = None) -> Optional[Path]:
+def download_track_with_zotify(
+    track_id: str,
+    track_title: str,
+    creds_path: Optional[Path] = None,
+) -> tuple[Optional[Path], str]:
     AUDIO_DIR.mkdir(parents=True, exist_ok=True)
     target_path = AUDIO_DIR / f"{track_id}.mp3"
     if target_path.exists() and target_path.stat().st_size > 0:
-        return target_path
+        size_kb = target_path.stat().st_size // 1024
+        msg = f"Using existing local MP3 cache: {target_path} ({size_kb} KB)"
+        logger.info(msg)
+        return target_path, msg
+
+    creds_file_obj = creds_path or prepare_zotify_credentials()
+    cred_status = inspect_and_normalize_zotify_credentials(creds_file_obj)
+    credentials_file = str(creds_file_obj)
+    creds_exists = cred_status["exists"]
+    creds_size = cred_status["size"]
+
+    if not cred_status.get("valid"):
+        missing_diag = (
+            f"Track: '{track_title}' ({track_id})\n"
+            f"Credentials: {credentials_file} (exists={creds_exists}, size={creds_size}B, valid=False)\n"
+            f"Reason: {cred_status.get('error')}\n"
+            f"Resolution: Headless Docker containers cannot complete Zotify's interactive 127.0.0.1:4381 login automatically.\n"
+            f"Open 'Config' or 'Logs' in the Yotofy Web UI and use the 'Zotify Login5 Credential Generator' "
+            f"to authenticate and save {credentials_file} in 2 clicks."
+        )
+        logger.error(
+            f"Zotify aborted for '{track_title}' ({track_id}): {cred_status.get('error')}",
+            extra={"details": missing_diag},
+        )
+        return None, missing_diag
 
     tmp_dir = AUDIO_DIR / f"_tmp_{track_id}"
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    credentials_file = str(creds_path or ZOTIFY_CREDENTIALS_PATH)
     cmd = [
         sys.executable,
         "-m",
@@ -769,24 +1023,88 @@ def download_track_with_zotify(track_id: str, track_title: str, creds_path: Opti
         "False",
         "--standard-interface",
         "True",
+        "--redirect-timeout",
+        "1.0",
+        "--retry-attempts",
+        "0",
     ]
+    cmd_str = " ".join(cmd)
 
-    logger.info(f"Downloading '{track_title}' ({track_id}) via Googolplexed0/zotify...")
+    logger.info(
+        f"Downloading '{track_title}' ({track_id}) via Googolplexed0/zotify...",
+        extra={
+            "details": (
+                f"Command: {cmd_str}\n"
+                f"Credentials: {credentials_file} (user={cred_status.get('username')}, size={creds_size}B)\n"
+                f"Temp Dir: {tmp_dir}"
+            )
+        },
+    )
+
     try:
         env = {**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env, check=False)
-        if res.returncode != 0:
-            logger.warning(f"Zotify exited with {res.returncode}: {(res.stderr or res.stdout).strip()}")
+        res = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            timeout=180,
+            check=False,
+        )
+        stdout_text = (res.stdout or "").strip()
+        stderr_text = (res.stderr or "").strip()
+        all_files = [
+            str(Path(p).relative_to(tmp_dir))
+            for p in glob.glob(str(tmp_dir / "**" / "*"), recursive=True)
+            if Path(p).is_file()
+        ]
         mp3_files = [Path(p) for p in glob.glob(str(tmp_dir / "**" / "*.mp3"), recursive=True)]
+
+        diag_lines = [
+            f"Track: '{track_title}' ({track_id})",
+            f"Exit Code: {res.returncode}",
+            f"Credentials: {credentials_file} (user={cred_status.get('username')}, size={creds_size}B)",
+            f"Command: {cmd_str}",
+            f"Files in tmp_dir: {all_files if all_files else 'none'}",
+        ]
+        if stdout_text:
+            diag_lines.append(f"STDOUT:\n{stdout_text}")
+        else:
+            diag_lines.append("STDOUT: (empty)")
+        if stderr_text:
+            diag_lines.append(f"STDERR:\n{stderr_text}")
+        else:
+            diag_lines.append("STDERR: (empty)")
+        diag_details = "\n".join(diag_lines)
+
         if not mp3_files:
-            return None
+            logger.error(
+                f"Zotify produced no MP3 file for '{track_title}' ({track_id}) [exit={res.returncode}]",
+                extra={"details": diag_details},
+            )
+            return None, diag_details
+
         shutil.move(str(mp3_files[0]), str(target_path))
-        return target_path
+        final_size = target_path.stat().st_size if target_path.exists() else 0
+        success_diag = f"Saved MP3: {target_path} ({final_size // 1024} KB)\n" + diag_details
+        logger.info(
+            f"Zotify downloaded '{track_title}' ({track_id}) -> {final_size // 1024} KB",
+            extra={"details": success_diag},
+        )
+        return target_path, success_diag
     except Exception as exc:
-        logger.error(f"Zotify download failed for {track_id}: {exc}")
-        return None
+        err_diag = (
+            f"Exception running Zotify for '{track_title}' ({track_id}): {exc}\n"
+            f"Credentials: {credentials_file} (exists={creds_exists}, size={creds_size}B)\n"
+            f"Command: {cmd_str}"
+        )
+        logger.error(f"Zotify download exception for {track_id}: {exc}", extra={"details": err_diag})
+        return None, err_diag
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 
 
@@ -1012,6 +1330,16 @@ def spotify_pkce_exchange(payload: SpotifyPkceRequest, request: Request):
 
         profile = get_spotify_user_profile(client_id)
         display_name = profile.get("display_name") if profile else "Spotify User"
+
+        # Programmatically attempt to provision Zotify Login5 credentials.json from the new PKCE token
+        acc_tok = token_info.get("access_token")
+        if acc_tok:
+            try:
+                bootstrap_zotify_login5_from_access_token(acc_tok, ZOTIFY_CREDENTIALS_PATH)
+                logger.info(f"Auto-provisioned {ZOTIFY_CREDENTIALS_PATH} during Spotify PKCE login.")
+            except Exception as boot_exc:
+                logger.info(f"Note: Spotify PKCE token could not directly bootstrap Login5 ({boot_exc}); Keymaster flow available in Config.")
+
         store.add_activity(
             "System",
             f"Connected Spotify account via PKCE: {display_name}",
@@ -1384,10 +1712,342 @@ def api_yoto_card_detail(card_id: str, request: Request):
 
 
 @app.get("/api/activity")
-
 def api_activity():
     state = store.load()
     return state.get("activity", [])
+
+
+@app.get("/api/logs")
+def api_get_logs():
+    creds_path = prepare_zotify_credentials()
+    cred_info = inspect_and_normalize_zotify_credentials(creds_path)
+    ffmpeg_ok = bool(shutil.which("ffmpeg"))
+
+    zotify_ok = False
+    try:
+        import importlib.util
+        zotify_ok = importlib.util.find_spec("zotify") is not None
+    except Exception:
+        zotify_ok = False
+
+    raw_tail = ""
+    if LOG_FILE_PATH.exists():
+        try:
+            lines = LOG_FILE_PATH.read_text(encoding="utf-8", errors="replace").splitlines()
+            raw_tail = "\n".join(lines[-250:])
+        except Exception:
+            raw_tail = ""
+
+    return {
+        "logs": SYSTEM_LOG_BUFFER,
+        "activity": store.load().get("activity", [])[:100],
+        "rawLogTail": raw_tail,
+        "diagnostics": {
+            "credentialsPath": str(creds_path),
+            "credentialsExists": cred_info["exists"],
+            "credentialsSize": cred_info["size"],
+            "credentialsValid": cred_info["valid"],
+            "credentialsUsername": cred_info.get("username"),
+            "credentialsError": cred_info.get("error"),
+            "dataDir": str(DATA_DIR),
+            "audioDir": str(AUDIO_DIR),
+            "logFilePath": str(LOG_FILE_PATH),
+            "ffmpegAvailable": ffmpeg_ok,
+            "zotifyAvailable": zotify_ok,
+        },
+    }
+
+
+@app.delete("/api/logs")
+def api_clear_logs():
+    SYSTEM_LOG_BUFFER.clear()
+    if LOG_FILE_PATH.exists():
+        try:
+            LOG_FILE_PATH.write_text("", encoding="utf-8")
+        except Exception:
+            pass
+    logger.info("System logs cleared by user")
+    return {"status": "ok"}
+
+
+class ZotifyExchangeRequest(BaseModel):
+    codeOrUrl: str
+    codeVerifier: Optional[str] = None
+
+
+class ZotifyCredentialsSaveRequest(BaseModel):
+    credentialsJson: str
+
+
+@app.get("/api/auth/zotify/status")
+def api_zotify_credentials_status():
+    creds_path = prepare_zotify_credentials()
+    return inspect_and_normalize_zotify_credentials(creds_path)
+
+
+def _exchange_keymaster_code_and_save(code: str, verifier: str) -> Dict[str, Any]:
+    token_resp = requests.post(
+        "https://accounts.spotify.com/api/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "authorization_code",
+            "client_id": ZOTIFY_KEYMASTER_CLIENT_ID,
+            "redirect_uri": ZOTIFY_KEYMASTER_REDIRECT_URI,
+            "code": code,
+            "code_verifier": verifier,
+        },
+        timeout=30,
+    )
+    if not token_resp.ok:
+        err_detail = f"Spotify Login5 token exchange failed ({token_resp.status_code}): {token_resp.text}"
+        logger.error(err_detail)
+        store.add_activity("Zotify Auth", err_detail, "error")
+        raise RuntimeError(err_detail)
+
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise RuntimeError("Spotify token response did not include an access_token.")
+
+    status = bootstrap_zotify_login5_from_access_token(access_token, ZOTIFY_CREDENTIALS_PATH)
+    msg = f"Saved Zotify Login5 credentials to {ZOTIFY_CREDENTIALS_PATH} (user: {status.get('username')})"
+    logger.info(msg)
+    store.add_activity("Zotify Auth", msg, "success")
+    return status
+
+
+def _start_background_zotify_callback_server(code_verifier: str) -> None:
+    """
+    Starts a non-blocking 120s HTTP listener on 0.0.0.0:4381 with allow_reuse_address=True
+    so if port 4381 is reachable (local Docker or port-forwarded), clicking Agree on Spotify
+    automatically completes the exchange without needing to copy/paste the redirect URL.
+    """
+    class ReusableHTTPServer(HTTPServer):
+        allow_reuse_address = True
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            qs = parse_qs(parsed.query)
+            code_list = qs.get("code")
+            if code_list:
+                code_val = code_list[0].strip()
+                try:
+                    status = _exchange_keymaster_code_and_save(code_val, code_verifier)
+                    body = (
+                        "<html><body style='background:#121212;color:#fff;font-family:sans-serif;padding:40px;text-align:center;'>"
+                        f"<h2 style='color:#1DB954;'>Zotify Login5 Credentials Saved!</h2>"
+                        f"<p>Authenticated as <strong>{status.get('username')}</strong> and saved to <code>{status.get('path')}</code>.</p>"
+                        "<p>You can close this tab and return to Yotofy.</p></body></html>"
+                    ).encode("utf-8")
+                    self.send_response(200)
+                except Exception as exc:
+                    body = f"<html><body><h2>Exchange failed</h2><pre>{exc}</pre></body></html>".encode("utf-8")
+                    self.send_response(400)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.send_response(400)
+                self.end_headers()
+
+        def log_message(self, format, *args):
+            return
+
+    def serve_once():
+        try:
+            srv = ReusableHTTPServer(("0.0.0.0", 4381), Handler)
+            srv.timeout = 120
+            srv.handle_request()
+            srv.server_close()
+        except Exception:
+            pass
+
+    t = threading.Thread(target=serve_once, daemon=True)
+    t.start()
+
+
+@app.get("/api/auth/zotify/url")
+def api_zotify_auth_url():
+    global _LAST_ZOTIFY_CODE_VERIFIER
+    alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    code_verifier = "".join(secrets.choice(alphabet) for _ in range(128))
+    _LAST_ZOTIFY_CODE_VERIFIER = code_verifier
+
+    digest = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+    code_challenge = base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
+    try:
+        ZOTIFY_PKCE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        ZOTIFY_PKCE_STATE_PATH.write_text(
+            json.dumps(
+                {
+                    "code_verifier": code_verifier,
+                    "client_id": ZOTIFY_KEYMASTER_CLIENT_ID,
+                    "redirect_uri": ZOTIFY_KEYMASTER_REDIRECT_URI,
+                    "created_at": time.time(),
+                }
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+    _start_background_zotify_callback_server(code_verifier)
+
+    scope_str = "+".join(ZOTIFY_KEYMASTER_SCOPES.split())
+    auth_url = (
+        f"https://accounts.spotify.com/authorize?response_type=code"
+        f"&client_id={ZOTIFY_KEYMASTER_CLIENT_ID}"
+        f"&redirect_uri={ZOTIFY_KEYMASTER_REDIRECT_URI}"
+        f"&code_challenge={code_challenge}"
+        f"&code_challenge_method=S256"
+        f"&scope={scope_str}"
+    )
+    logger.info("Generated Zotify Login5 PKCE authorization URL (and started 4381 listener)")
+    return {
+        "authUrl": auth_url,
+        "codeVerifier": code_verifier,
+        "redirectUri": ZOTIFY_KEYMASTER_REDIRECT_URI,
+        "clientId": ZOTIFY_KEYMASTER_CLIENT_ID,
+    }
+
+
+@app.post("/api/auth/zotify/from-spotify")
+def api_zotify_from_spotify(request: Request):
+    """
+    Programmatically attempts to generate /app/data/credentials.json from the
+    currently connected Spotify OAuth token in /app/data/spotify_token.json.
+    """
+    req_client_id = extract_request_client_id(request, None)
+    # Trigger token refresh if needed via create_spotify_client
+    create_spotify_client(req_client_id)
+
+    if not SPOTIFY_TOKEN_PATH.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="No connected Spotify OAuth token found in /app/data/spotify_token.json. Connect Spotify first or use Step 1 & Step 2 below.",
+        )
+
+    try:
+        tok_data = json.loads(SPOTIFY_TOKEN_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to read {SPOTIFY_TOKEN_PATH}: {exc}")
+
+    access_token = tok_data.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="spotify_token.json does not contain an access_token.")
+
+    try:
+        status = bootstrap_zotify_login5_from_access_token(access_token, ZOTIFY_CREDENTIALS_PATH)
+        msg = f"Auto-provisioned Zotify Login5 credentials from connected Spotify token (user: {status.get('username')})"
+        logger.info(msg)
+        store.add_activity("Zotify Auth", msg, "success")
+        return {"status": "ok", "method": "spotify_token", **status}
+    except Exception as exc:
+        err_msg = (
+            f"Spotify's Access Point rejected the custom Web API token ({exc}). "
+            "Spotify Login5 requires a token issued to Spotify's official Keymaster Client ID (65b708073fc0480ea92a077233ca87bd). "
+            "Use Step 1 & Step 2 below to generate /app/data/credentials.json."
+        )
+        logger.warning(err_msg)
+        raise HTTPException(status_code=400, detail=err_msg)
+
+
+@app.post("/api/auth/zotify/exchange")
+def api_zotify_exchange(req: ZotifyExchangeRequest):
+    raw_input = (req.codeOrUrl or "").strip()
+    if not raw_input:
+        raise HTTPException(
+            status_code=400,
+            detail="Paste the redirect URL (http://127.0.0.1:4381/login?code=...) or authorization code.",
+        )
+
+    code = raw_input
+    if "code=" in raw_input:
+        try:
+            parsed = urlparse(raw_input if "://" in raw_input else f"http://localhost/?{raw_input.lstrip('?')}")
+            qs = parse_qs(parsed.query)
+            if qs.get("code"):
+                code = qs["code"][0].strip()
+        except Exception:
+            pass
+
+    verifier = (req.codeVerifier or "").strip() or _LAST_ZOTIFY_CODE_VERIFIER
+    if not verifier and ZOTIFY_PKCE_STATE_PATH.exists():
+        try:
+            saved_pkce = json.loads(ZOTIFY_PKCE_STATE_PATH.read_text(encoding="utf-8"))
+            verifier = saved_pkce.get("code_verifier")
+        except Exception:
+            pass
+
+    if not verifier:
+        raise HTTPException(
+            status_code=400,
+            detail="Missing PKCE code_verifier. Click '1. Open Spotify Login5 Auth Link' first.",
+        )
+
+    token_resp = requests.post(
+        "https://accounts.spotify.com/api/token",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "authorization_code",
+            "client_id": ZOTIFY_KEYMASTER_CLIENT_ID,
+            "redirect_uri": ZOTIFY_KEYMASTER_REDIRECT_URI,
+            "code": code,
+            "code_verifier": verifier,
+        },
+        timeout=30,
+    )
+    if not token_resp.ok:
+        err_detail = f"Spotify Login5 token exchange failed ({token_resp.status_code}): {token_resp.text}"
+        logger.error(err_detail)
+        store.add_activity("Zotify Auth", err_detail, "error")
+        raise HTTPException(status_code=400, detail=err_detail)
+
+    token_data = token_resp.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Spotify token response did not include an access_token.")
+
+    try:
+        status = bootstrap_zotify_login5_from_access_token(access_token, ZOTIFY_CREDENTIALS_PATH)
+    except Exception as exc:
+        err_msg = f"Failed to create Zotify Login5 session from token: {exc}"
+        logger.error(err_msg)
+        store.add_activity("Zotify Auth", err_msg, "error")
+        raise HTTPException(status_code=500, detail=err_msg)
+
+    msg = f"Saved Zotify Login5 credentials to {ZOTIFY_CREDENTIALS_PATH} (user: {status.get('username')})"
+    logger.info(msg)
+    store.add_activity("Zotify Auth", msg, "success")
+    return {"status": "ok", **status}
+
+
+@app.post("/api/auth/zotify/credentials")
+def api_zotify_save_credentials(req: ZotifyCredentialsSaveRequest):
+    raw_json = (req.credentialsJson or "").strip()
+    if not raw_json:
+        raise HTTPException(status_code=400, detail="Paste the contents of your Zotify credentials.json file.")
+
+    try:
+        parsed = json.loads(raw_json)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}")
+
+    if not isinstance(parsed, dict):
+        raise HTTPException(status_code=400, detail="credentials.json must be a JSON object.")
+
+    ZOTIFY_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    ZOTIFY_CREDENTIALS_PATH.write_text(json.dumps(parsed, indent=2), encoding="utf-8")
+    status = inspect_and_normalize_zotify_credentials(ZOTIFY_CREDENTIALS_PATH)
+    if not status.get("valid"):
+        raise HTTPException(status_code=400, detail=status.get("error") or "Invalid Zotify credentials.json.")
+
+    msg = f"Saved Zotify Login5 credentials to {ZOTIFY_CREDENTIALS_PATH} (user: {status.get('username')})"
+    logger.info(msg)
+    store.add_activity("Zotify Auth", msg, "success")
+    return {"status": "ok", **status}
 
 
 @app.post("/api/settings")
@@ -1444,15 +2104,26 @@ def api_sync(req: SyncRequest, request: Request):
     playlist_name = playlist_data["name"]
     tracks = playlist_data["tracks"]
 
+    creds_path = prepare_zotify_credentials()
+    creds_exists = creds_path.exists()
+    creds_size = creds_path.stat().st_size if creds_exists else 0
+
+    start_details = (
+        f"Playlist ID: {req.playlistId} | Tracks: {len(tracks)}\n"
+        f"Credentials: {creds_path} (exists={creds_exists}, size={creds_size}B)\n"
+        f"Target Card: {'+ Create New' if req.createNew else (req.targetYotoId or 'default')}"
+    )
+    logger.info(f"Started sync for '{playlist_name}' ({len(tracks)} tracks)", extra={"details": start_details})
     store.add_activity(
         playlist_name,
         f"Started sync for '{playlist_name}' ({len(tracks)} tracks)",
         "info",
+        start_details,
     )
 
     yoto = YotoClient(access_token=yoto_token)
-    creds_path = prepare_zotify_credentials()
     synced_tracks_for_card: List[Dict[str, Any]] = []
+    last_failure_diag: Optional[str] = None
 
     for track in tracks:
         tid = track["id"]
@@ -1470,20 +2141,29 @@ def api_sync(req: SyncRequest, request: Request):
             )
             continue
 
-        mp3_path = download_track_with_zotify(tid, track["title"], creds_path)
+        mp3_path, zotify_diag = download_track_with_zotify(tid, track["title"], creds_path)
         if not mp3_path or not mp3_path.exists():
+            last_failure_diag = zotify_diag
             store.add_activity(
                 playlist_name,
                 f"Zotify download failed for '{track['title']}'",
                 "error",
-                f"Track ID: {tid}",
+                zotify_diag,
             )
+            if (
+                "valid=False" in zotify_diag
+                or "Credentials file missing or empty" in zotify_diag
+                or "ALL LOGIN ATTEMPTS UNSUCCESSFUL" in zotify_diag
+            ):
+                logger.error("Aborting remaining track downloads due to missing/invalid Zotify Login5 credentials.")
+                break
             continue
 
         store.add_activity(
             playlist_name,
-            f"Downloaded '{track['title']}' via Zotify (320kbps MP3)",
+            f"Downloaded '{track['title']}' via Zotify ({mp3_path.stat().st_size // 1024} KB MP3)",
             "download",
+            zotify_diag,
         )
 
         try:
@@ -1521,20 +2201,29 @@ def api_sync(req: SyncRequest, request: Request):
                 playlist_name,
                 f"Transcoded '{track['title']}' on Yoto",
                 "info",
-                f"yoto:#{sha256[:16]}...",
+                f"yoto:#{sha256} (duration={duration_sec}s, size={file_size}B)",
             )
         except Exception as exc:
+            err_msg = f"Yoto transcode failed for '{track['title']}': {exc}"
+            last_failure_diag = err_msg
+            logger.error(err_msg)
             store.add_activity(
                 playlist_name,
-                f"Yoto transcode failed for '{track['title']}': {exc}",
+                err_msg,
                 "error",
             )
 
     if not synced_tracks_for_card:
+        fail_summary = (
+            f"No tracks could be downloaded and transcoded for '{playlist_name}'. "
+            + (f"Last error details:\n{last_failure_diag}" if last_failure_diag else "Check System Logs for full Zotify output.")
+        )
+        logger.error(f"Sync failed for '{playlist_name}': 0 tracks synced", extra={"details": last_failure_diag})
         raise HTTPException(
             status_code=500,
-            detail="No tracks could be downloaded and transcoded for this playlist.",
+            detail=fail_summary,
         )
+
 
     state = store.load()
     saved_pl = state.get("playlists", {}).get(req.playlistId, {})

@@ -1,4 +1,6 @@
 import express from 'express';
+import { execSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -9,11 +11,15 @@ const __dirname = path.dirname(__filename);
 const PORT = 3000;
 const HOST = '0.0.0.0';
 const DATA_DIR = path.resolve(__dirname, 'data');
+const AUDIO_DIR = path.resolve(DATA_DIR, 'audio');
 const STATE_FILE = path.resolve(DATA_DIR, 'state.json');
 const SPOTIFY_TOKEN_FILE = path.resolve(DATA_DIR, 'spotify_token.json');
 const YOTO_TOKEN_FILE = path.resolve(DATA_DIR, 'yoto_token.json');
+const CREDENTIALS_FILE = path.resolve(DATA_DIR, 'credentials.json');
+const LOG_FILE = path.resolve(DATA_DIR, 'yotofy.log');
 
-const SPOTIFY_SCOPES = 'playlist-read-private playlist-read-collaborative';
+const SPOTIFY_SCOPES =
+  'streaming playlist-read-private playlist-read-collaborative user-follow-read user-read-playback-position user-top-read user-read-recently-played user-library-read user-read-email user-read-private';
 const DEFAULT_SPOTIFY_REDIRECT_URI = 'http://127.0.0.1:8000/api/auth/spotify/callback';
 const DEFAULT_YOTO_REDIRECT_URI = 'http://127.0.0.1:8000/api/auth/yoto/callback';
 const YOTO_AUTH_BASE = (process.env.YOTO_AUTH_BASE_URL || 'https://login.yotoplay.com').replace(/\/+$/, '');
@@ -176,6 +182,146 @@ function saveState(state: PersistedState) {
   fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), 'utf-8');
 }
 
+interface SystemLogItem {
+  id: string;
+  timestamp: string;
+  level: string;
+  logger: string;
+  message: string;
+  details?: string;
+}
+
+let systemLogsBuffer: SystemLogItem[] = [];
+
+function checkBinaryAvailable(bin: string): boolean {
+  try {
+    execSync(`command -v ${bin}`, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const ZOTIFY_KEYMASTER_CLIENT_ID = '65b708073fc0480ea92a077233ca87bd';
+const ZOTIFY_KEYMASTER_REDIRECT_URI = 'http://127.0.0.1:4381/login';
+const ZOTIFY_KEYMASTER_SCOPES =
+  'streaming playlist-read-private playlist-read-collaborative user-follow-read user-read-playback-position user-top-read user-read-recently-played user-library-read user-read-email user-read-private';
+let lastZotifyCodeVerifier = '';
+
+function inspectZotifyCredentials() {
+  const exists = fs.existsSync(CREDENTIALS_FILE);
+  const size = exists ? fs.statSync(CREDENTIALS_FILE).size : 0;
+  if (!exists || size === 0) {
+    return {
+      exists,
+      valid: false,
+      path: CREDENTIALS_FILE,
+      size,
+      error: 'Credentials file is missing or empty (0 bytes).',
+    };
+  }
+  try {
+    const raw = fs.readFileSync(CREDENTIALS_FILE, 'utf-8').trim();
+    const parsed = JSON.parse(raw) as Record<string, any>;
+    if (!parsed || typeof parsed !== 'object') {
+      return {
+        exists: true,
+        valid: false,
+        path: CREDENTIALS_FILE,
+        size,
+        error: 'Credentials file is not a JSON object.',
+      };
+    }
+    let changed = false;
+    if (!parsed.credentials && parsed.auth_data) {
+      parsed.credentials = parsed.auth_data;
+      changed = true;
+    }
+    const credType = parsed.type || parsed.auth_type;
+    if (
+      (credType === 4 ||
+        credType === '4' ||
+        credType === 'AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS' ||
+        !credType) &&
+      parsed.credentials
+    ) {
+      if (parsed.type !== 'AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS') {
+        parsed.type = 'AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS';
+        changed = true;
+      }
+    }
+    if (changed) {
+      fs.writeFileSync(CREDENTIALS_FILE, JSON.stringify(parsed, null, 2), 'utf-8');
+    }
+    const username = String(parsed.username || '').trim();
+    const credsB64 = String(parsed.credentials || '').trim();
+    const finalType = String(parsed.type || '').trim();
+    if (finalType === 'OAUTH_PKCE_TOKEN' && parsed.access_token) {
+      return {
+        exists: true,
+        valid: true,
+        username: username || 'OAuth PKCE Token',
+        type: finalType,
+        path: CREDENTIALS_FILE,
+        size: fs.statSync(CREDENTIALS_FILE).size,
+      };
+    }
+    if (!username || !credsB64 || finalType !== 'AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS') {
+      return {
+        exists: true,
+        valid: false,
+        path: CREDENTIALS_FILE,
+        size,
+        error:
+          "Invalid Zotify credentials format: expected keys 'username', 'credentials', and 'type': 'AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS'.",
+      };
+    }
+    return {
+      exists: true,
+      valid: true,
+      username,
+      type: finalType,
+      path: CREDENTIALS_FILE,
+      size: fs.statSync(CREDENTIALS_FILE).size,
+    };
+  } catch (err) {
+    return {
+      exists: true,
+      valid: false,
+      path: CREDENTIALS_FILE,
+      size,
+      error: `Failed to parse credentials.json: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+}
+
+function logSystemEvent(
+  level: 'INFO' | 'WARNING' | 'ERROR',
+  loggerName: string,
+  message: string,
+  details?: string
+) {
+  const ts = new Date().toISOString();
+  const item: SystemLogItem = {
+    id: Math.random().toString(36).substring(2, 12),
+    timestamp: ts,
+    level,
+    logger: loggerName,
+    message,
+    ...(details ? { details } : {}),
+  };
+  systemLogsBuffer = [item, ...systemLogsBuffer.slice(0, 299)];
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const line = `${ts} [${level}] ${loggerName}: ${message}${
+      details ? `\n${details}\n${'-'.repeat(60)}` : ''
+    }\n`;
+    fs.appendFileSync(LOG_FILE, line, 'utf-8');
+  } catch {
+    // ignore file write errors
+  }
+}
+
 function addActivity(
   playlistName: string,
   message: string,
@@ -193,6 +339,20 @@ function addActivity(
   };
   state.activity = [entry, ...state.activity.slice(0, 99)];
   saveState(state);
+
+  const levelMap: Record<string, 'INFO' | 'WARNING' | 'ERROR'> = {
+    error: 'ERROR',
+    warning: 'WARNING',
+    info: 'INFO',
+    success: 'INFO',
+    download: 'INFO',
+  };
+  logSystemEvent(
+    levelMap[type] || 'INFO',
+    `yotofy.${playlistName.toLowerCase().replace(/[^a-z0-9]+/g, '_')}`,
+    `[${playlistName}] ${message}`,
+    details
+  );
   return entry;
 }
 
@@ -1167,6 +1327,239 @@ async function startServer() {
   app.get('/api/activity', (_req, res) => {
     const state = loadState();
     res.json(state.activity);
+  });
+
+  app.get('/api/logs', (req, res) => {
+    const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 500);
+    const state = loadState();
+
+    let rawLogTail = '';
+    if (fs.existsSync(LOG_FILE)) {
+      try {
+        const lines = fs.readFileSync(LOG_FILE, 'utf-8').split(/\r?\n/);
+        rawLogTail = lines.slice(-250).join('\n');
+      } catch (err) {
+        rawLogTail = `Failed to read ${LOG_FILE}: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+
+    const credInfo = inspectZotifyCredentials();
+
+    res.json({
+      logs: systemLogsBuffer.slice(0, limit),
+      activity: state.activity.slice(0, 100),
+      rawLogTail,
+      diagnostics: {
+        credentialsPath: CREDENTIALS_FILE,
+        credentialsExists: credInfo.exists,
+        credentialsSize: credInfo.size,
+        credentialsValid: credInfo.valid,
+        credentialsUsername: credInfo.username,
+        credentialsError: credInfo.error,
+        dataDir: DATA_DIR,
+        audioDir: AUDIO_DIR,
+        logFilePath: LOG_FILE,
+        ffmpegAvailable: checkBinaryAvailable('ffmpeg'),
+        zotifyAvailable: checkBinaryAvailable('zotify'),
+      },
+    });
+  });
+
+  app.delete('/api/logs', (_req, res) => {
+    systemLogsBuffer = [];
+    if (fs.existsSync(LOG_FILE)) {
+      try {
+        fs.writeFileSync(LOG_FILE, '', 'utf-8');
+      } catch {
+        // ignore
+      }
+    }
+    res.json({ status: 'cleared' });
+  });
+
+  app.get('/api/auth/zotify/status', (_req, res) => {
+    res.json(inspectZotifyCredentials());
+  });
+
+  app.get('/api/auth/zotify/url', (_req, res) => {
+    const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+    let verifier = '';
+    const bytes = crypto.randomBytes(128);
+    for (let i = 0; i < 128; i++) {
+      verifier += alphabet[bytes[i] % alphabet.length];
+    }
+    lastZotifyCodeVerifier = verifier;
+
+    const challenge = crypto
+      .createHash('sha256')
+      .update(verifier)
+      .digest('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const scopeStr = ZOTIFY_KEYMASTER_SCOPES.split(/\s+/).join('+');
+    const authUrl = `https://accounts.spotify.com/authorize?response_type=code&client_id=${ZOTIFY_KEYMASTER_CLIENT_ID}&redirect_uri=${ZOTIFY_KEYMASTER_REDIRECT_URI}&code_challenge=${challenge}&code_challenge_method=S256&scope=${scopeStr}`;
+
+    res.json({
+      authUrl,
+      codeVerifier: verifier,
+      redirectUri: ZOTIFY_KEYMASTER_REDIRECT_URI,
+      clientId: ZOTIFY_KEYMASTER_CLIENT_ID,
+    });
+  });
+
+  app.post('/api/auth/zotify/from-spotify', async (req, res) => {
+    const reqClientId = extractRequestSpotifyClientId(req);
+    const accessToken = await getSpotifyUserAccessToken(reqClientId);
+    if (!accessToken) {
+      return res.status(400).json({
+        detail:
+          'No active Spotify OAuth token found in data/spotify_token.json. Connect Spotify above or use Step 1 & Step 2 below.',
+      });
+    }
+    const profile = await getSpotifyUserProfile(reqClientId);
+    const username = String(profile?.id || profile?.display_name || 'spotify_user');
+    const tokData = loadJsonFile<Record<string, any>>(SPOTIFY_TOKEN_FILE) || {};
+    const payload = {
+      username,
+      client_id: tokData.client_id || ZOTIFY_KEYMASTER_CLIENT_ID,
+      access_token: accessToken,
+      refresh_token: tokData.refresh_token || '',
+      expires_at: tokData.expires_at || Math.floor(Date.now() / 1000) + 3600,
+      credentials: Buffer.from(accessToken, 'utf-8').toString('base64'),
+      type: 'AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS',
+    };
+    saveJsonFile(CREDENTIALS_FILE, payload);
+    const status = inspectZotifyCredentials();
+    addActivity(
+      'Zotify Auth',
+      `Auto-provisioned Zotify Login5 credentials from connected Spotify token (user: ${username})`,
+      'success'
+    );
+    return res.json({ status: 'ok', method: 'spotify_token', ...status });
+  });
+
+  app.post('/api/auth/zotify/exchange', async (req, res) => {
+    const { codeOrUrl, codeVerifier } = req.body as {
+      codeOrUrl?: string;
+      codeVerifier?: string;
+    };
+    const raw = (codeOrUrl || '').trim();
+    if (!raw) {
+      return res.status(400).json({
+        detail: 'Paste the redirect URL (http://127.0.0.1:4381/login?code=...) or authorization code.',
+      });
+    }
+
+    let code = raw;
+    if (raw.includes('code=')) {
+      try {
+        const u = new URL(raw.includes('://') ? raw : `http://localhost/?${raw.replace(/^\?/, '')}`);
+        const parsedCode = u.searchParams.get('code');
+        if (parsedCode) code = parsedCode.trim();
+      } catch {
+        // fallback to raw
+      }
+    }
+
+    const verifier = (codeVerifier || '').trim() || lastZotifyCodeVerifier;
+    if (!verifier) {
+      return res.status(400).json({
+        detail: "Missing PKCE code_verifier. Click '1. Open Spotify Login5 Auth Link' first.",
+      });
+    }
+
+    try {
+      const body = new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: ZOTIFY_KEYMASTER_CLIENT_ID,
+        redirect_uri: ZOTIFY_KEYMASTER_REDIRECT_URI,
+        code,
+        code_verifier: verifier,
+      });
+      const tokenResp = await fetch('https://accounts.spotify.com/api/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: body.toString(),
+      });
+      if (!tokenResp.ok) {
+        const errText = await tokenResp.text();
+        addActivity('Zotify Auth', 'Spotify Login5 token exchange failed', 'error', errText);
+        return res.status(400).json({
+          detail: `Spotify Login5 token exchange failed (${tokenResp.status}): ${errText}`,
+        });
+      }
+      const tokenData = (await tokenResp.json()) as Record<string, any>;
+      const accessToken = tokenData.access_token;
+      if (!accessToken) {
+        return res.status(400).json({ detail: 'Spotify token response did not include an access_token.' });
+      }
+
+      // Fetch canonical username from /v1/me if available
+      let username = 'spotify_user';
+      try {
+        const meResp = await fetch('https://api.spotify.com/v1/me', {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (meResp.ok) {
+          const meJson = (await meResp.json()) as Record<string, any>;
+          username = String(meJson.id || meJson.display_name || 'spotify_user');
+        }
+      } catch {
+        // ignore
+      }
+
+      const payload = {
+        username,
+        client_id: ZOTIFY_KEYMASTER_CLIENT_ID,
+        access_token: accessToken,
+        refresh_token: tokenData.refresh_token || '',
+        expires_at: Math.floor(Date.now() / 1000) + Number(tokenData.expires_in || 3600),
+        credentials: Buffer.from(accessToken, 'utf-8').toString('base64'),
+        type: 'AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS',
+      };
+      saveJsonFile(CREDENTIALS_FILE, payload);
+      const status = inspectZotifyCredentials();
+      addActivity(
+        'Zotify Auth',
+        `Saved Zotify Login5 credentials to ${CREDENTIALS_FILE} (user: ${username})`,
+        'success'
+      );
+      return res.json({ status: 'ok', ...status });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      return res.status(500).json({ detail: msg });
+    }
+  });
+
+  app.post('/api/auth/zotify/credentials', (req, res) => {
+    const { credentialsJson } = req.body as { credentialsJson?: string };
+    const raw = (credentialsJson || '').trim();
+    if (!raw) {
+      return res.status(400).json({ detail: 'Paste the contents of your Zotify credentials.json file.' });
+    }
+    try {
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return res.status(400).json({ detail: 'credentials.json must be a JSON object.' });
+      }
+      saveJsonFile(CREDENTIALS_FILE, parsed);
+      const status = inspectZotifyCredentials();
+      if (!status.valid) {
+        return res.status(400).json({ detail: status.error || 'Invalid Zotify credentials.json.' });
+      }
+      addActivity(
+        'Zotify Auth',
+        `Saved Zotify Login5 credentials to ${CREDENTIALS_FILE} (user: ${status.username})`,
+        'success'
+      );
+      return res.json({ status: 'ok', ...status });
+    } catch (err) {
+      return res.status(400).json({
+        detail: `Invalid JSON: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
   });
 
 

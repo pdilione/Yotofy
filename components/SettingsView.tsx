@@ -21,6 +21,7 @@ import {
   SPOTIFY_PKCE_RESULT_STORAGE_KEY,
   YOTO_PKCE_RESULT_STORAGE_KEY,
 } from '../services/api';
+import { ZotifyAuthPanel } from './ZotifyAuthPanel';
 import {
   Save,
   Server,
@@ -618,6 +619,9 @@ export const SettingsView: React.FC<Props> = ({
             </div>
           )}
         </div>
+
+        {/* Zotify Login5 Credentials Generator (/app/data/credentials.json) */}
+        <ZotifyAuthPanel />
 
         {/* Audio Source Strategy */}
         <div className="bg-gray-900 border border-white/5 rounded-2xl p-6">

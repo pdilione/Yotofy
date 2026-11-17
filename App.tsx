@@ -20,6 +20,7 @@ import { PlaylistCard } from './components/PlaylistCard';
 import { SyncView } from './components/SyncView';
 import { YotoCardDetailView } from './components/YotoCardDetailView';
 import { SettingsView } from './components/SettingsView';
+import { SystemLogsView } from './components/SystemLogsView';
 import { ActivityFeed } from './components/ActivityFeed';
 import { YotoDisplay } from './components/YotoDisplay';
 import {
@@ -32,6 +33,7 @@ import {
   Hash,
   PlusCircle,
   ArrowRight,
+  Terminal,
 } from 'lucide-react';
 
 const App: React.FC = () => {
@@ -286,6 +288,16 @@ const App: React.FC = () => {
           </button>
 
           <div className="w-px h-4 bg-gray-700 hidden md:block"></div>
+
+          <button
+            onClick={() => setCurrentScreen('logs')}
+            className={`flex items-center space-x-1.5 hover:text-white transition-colors ${
+              currentScreen === 'logs' ? 'text-spotify-green font-semibold' : ''
+            }`}
+          >
+            <Terminal size={16} />
+            <span>Logs</span>
+          </button>
 
           <button
             onClick={() => setCurrentScreen('settings')}
@@ -630,7 +642,11 @@ const App: React.FC = () => {
 
               {/* Activity Feed */}
               <div className="h-[500px]">
-                <ActivityFeed logs={logs} onLogsLoaded={setLogs} />
+                <ActivityFeed
+                  logs={logs}
+                  onLogsLoaded={setLogs}
+                  onOpenLogs={() => setCurrentScreen('logs')}
+                />
               </div>
             </div>
           </div>
@@ -644,6 +660,7 @@ const App: React.FC = () => {
             connected={connections.yoto && connections.spotify}
             settings={settings}
             yotoCards={yotoCards}
+            onOpenLogs={() => setCurrentScreen('logs')}
           />
         )}
 
@@ -656,6 +673,7 @@ const App: React.FC = () => {
             onBack={handleBack}
             onOpenSpotifyPlaylist={handleOpenSpotifyPlaylistFromCard}
             onCardSynced={handlePlaylistSynced}
+            onOpenLogs={() => setCurrentScreen('logs')}
           />
         )}
 
@@ -667,6 +685,8 @@ const App: React.FC = () => {
             onSpotifyConnected={loadBackendState}
           />
         )}
+
+        {currentScreen === 'logs' && <SystemLogsView onBack={handleBack} />}
 
       </main>
 

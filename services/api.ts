@@ -5,7 +5,18 @@ import {
   YotoCardConfig,
   ConnectedUserProfile,
   YotoMyoCard,
+  SystemLogEntry,
+  SystemDiagnostics,
+  ZotifyCredentialsStatus,
 } from '../types';
+
+export interface SystemLogsResponse {
+  logs: SystemLogEntry[];
+  activity?: ActivityLog[];
+  rawLogTail?: string;
+  diagnostics?: SystemDiagnostics;
+}
+
 
 export interface SystemStatusResponse {
   spotify: boolean;
@@ -45,7 +56,8 @@ export const YOTO_PKCE_VERIFIER_STORAGE_KEY = 'yotofy_yoto_pkce_verifier';
 export const YOTO_PKCE_REDIRECT_STORAGE_KEY = 'yotofy_yoto_pkce_redirect';
 export const YOTO_PKCE_RESULT_STORAGE_KEY = 'yotofy_yoto_pkce_result';
 
-export const SPOTIFY_SCOPES = 'playlist-read-private playlist-read-collaborative';
+export const SPOTIFY_SCOPES =
+  'streaming playlist-read-private playlist-read-collaborative user-follow-read user-read-playback-position user-top-read user-read-recently-played user-library-read user-read-email user-read-private';
 export const YOTO_SCOPES = 'user:content:manage family:library:manage';
 export const YOTO_AUDIENCE = 'https://api.yotoplay.com';
 export const YOTO_AUTHORIZE_ENDPOINT = 'https://login.yotoplay.com/authorize';
@@ -396,3 +408,108 @@ export const saveSettings = async (settings: AppSettings): Promise<AppSettings> 
   const data = await response.json();
   return data.settings || settings;
 };
+
+export const getSystemLogs = async (limit = 200): Promise<SystemLogsResponse> => {
+  const response = await fetch(`/api/logs?limit=${encodeURIComponent(String(limit))}`, {
+    method: 'GET',
+    headers: buildApiHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch system logs (${response.status})`);
+  }
+  return response.json();
+};
+
+export const clearSystemLogs = async (): Promise<void> => {
+  const response = await fetch('/api/logs', {
+    method: 'DELETE',
+    headers: buildApiHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to clear system logs (${response.status})`);
+  }
+};
+
+export const getZotifyCredentialsStatus = async (): Promise<ZotifyCredentialsStatus> => {
+  const response = await fetch('/api/auth/zotify/status', {
+    method: 'GET',
+    headers: buildApiHeaders(),
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to fetch Zotify credentials status (${response.status})`);
+  }
+  return response.json();
+};
+
+export const getZotifyAuthUrl = async (): Promise<{
+  authUrl: string;
+  codeVerifier: string;
+  redirectUri: string;
+  clientId: string;
+}> => {
+  const response = await fetch('/api/auth/zotify/url', {
+    method: 'GET',
+    headers: buildApiHeaders(),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(data.detail || `Failed to generate Zotify Login5 URL (${response.status})`);
+  }
+  return data;
+};
+
+export const exchangeZotifyCode = async (
+  codeOrUrl: string,
+  codeVerifier?: string
+): Promise<ZotifyCredentialsStatus & { status: string }> => {
+  const response = await fetch('/api/auth/zotify/exchange', {
+    method: 'POST',
+    headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ codeOrUrl, codeVerifier }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      data.detail || data.error || `Failed to exchange Zotify Login5 code (${response.status})`
+    );
+  }
+  return data;
+};
+
+export const saveZotifyCredentialsJson = async (
+  credentialsJson: string
+): Promise<ZotifyCredentialsStatus & { status: string }> => {
+  const response = await fetch('/api/auth/zotify/credentials', {
+    method: 'POST',
+    headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify({ credentialsJson }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      data.detail || data.error || `Failed to save Zotify credentials.json (${response.status})`
+    );
+  }
+  return data;
+};
+
+export const autoProvisionZotifyFromSpotifyToken = async (): Promise<
+  ZotifyCredentialsStatus & { status: string; method?: string }
+> => {
+  const response = await fetch('/api/auth/zotify/from-spotify', {
+    method: 'POST',
+    headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(
+      data.detail ||
+        data.error ||
+        `Failed to auto-provision Zotify credentials from Spotify token (${response.status})`
+    );
+  }
+  return data;
+};
+
+
+

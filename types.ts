@@ -115,8 +115,7 @@ export interface YotoMyoCard {
   linkedSpotifyPlaylistName?: string;
 }
 
-export type ScreenState = 'dashboard' | 'detail' | 'yoto_detail' | 'settings';
-
+export type ScreenState = 'dashboard' | 'detail' | 'yoto_detail' | 'settings' | 'logs';
 
 export type AudioProvider =
   | 'zotify'
@@ -154,4 +153,37 @@ export interface ActivityLog {
   message: string;
   type: 'info' | 'success' | 'warning' | 'error' | 'download';
   details?: string;
+}
+
+export interface SystemLogEntry {
+  id: string;
+  timestamp: string;
+  level: 'INFO' | 'WARNING' | 'ERROR' | 'DEBUG';
+  logger: string;
+  message: string;
+  details?: string;
+}
+
+export interface SystemDiagnostics {
+  credentialsPath: string;
+  credentialsExists: boolean;
+  credentialsSize: number;
+  credentialsValid?: boolean;
+  credentialsUsername?: string;
+  credentialsError?: string;
+  dataDir: string;
+  audioDir: string;
+  logFilePath: string;
+  ffmpegAvailable?: boolean;
+  zotifyAvailable?: boolean;
+}
+
+export interface ZotifyCredentialsStatus {
+  exists: boolean;
+  valid: boolean;
+  username?: string;
+  type?: string;
+  path: string;
+  size: number;
+  error?: string;
 }

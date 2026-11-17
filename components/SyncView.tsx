@@ -29,6 +29,7 @@ interface Props {
   connected: boolean;
   settings: AppSettings;
   yotoCards?: YotoMyoCard[];
+  onOpenLogs?: () => void;
 }
 
 export const SyncView: React.FC<Props> = ({
@@ -38,6 +39,7 @@ export const SyncView: React.FC<Props> = ({
   connected,
   settings,
   yotoCards = [],
+  onOpenLogs,
 }) => {
   const [currentPlaylist, setCurrentPlaylist] = useState<Playlist>(playlist);
   const [availableYotoCards, setAvailableYotoCards] = useState<YotoMyoCard[]>(yotoCards);
@@ -389,9 +391,25 @@ export const SyncView: React.FC<Props> = ({
             </div>
 
             {syncError && (
-              <div className="bg-red-500/10 text-red-200 p-3 rounded-xl text-xs border border-red-500/20 flex items-center gap-2">
-                <AlertCircle size={15} className="text-red-400 flex-shrink-0" />
-                <span>{syncError}</span>
+              <div className="bg-red-500/10 text-red-200 p-3.5 rounded-xl text-xs border border-red-500/30 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <div className="flex items-center gap-2 font-bold text-red-300">
+                    <AlertCircle size={15} className="text-red-400 shrink-0" />
+                    <span>Sync Failed — Diagnostic Output</span>
+                  </div>
+                  {onOpenLogs && (
+                    <button
+                      type="button"
+                      onClick={onOpenLogs}
+                      className="text-[11px] bg-red-500/20 hover:bg-red-500/30 text-red-200 px-2.5 py-1 rounded-lg border border-red-500/30 font-medium whitespace-nowrap shrink-0"
+                    >
+                      Open System Logs &rarr;
+                    </button>
+                  )}
+                </div>
+                <pre className="text-[11px] font-mono text-red-100 bg-black/50 p-2.5 rounded-lg border border-red-500/20 whitespace-pre-wrap break-words max-h-48 overflow-y-auto custom-scrollbar">
+                  {syncError}
+                </pre>
               </div>
             )}
 
