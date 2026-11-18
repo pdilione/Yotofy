@@ -794,13 +794,102 @@ ZOTIFY_KEYMASTER_SCOPES = (
 )
 ZOTIFY_PKCE_STATE_PATH = DATA_DIR / "zotify_pkce.json"
 _LAST_ZOTIFY_CODE_VERIFIER: Optional[str] = None
+_LOGIN5_VERIFICATION_CACHE: Dict[str, tuple[bool, Optional[str]]] = {}
+_CONSUMED_PKCE_CODES: Dict[str, float] = {}
+
+
+def _encode_proto_varint(val: int) -> bytes:
+    out = bytearray()
+    while val > 0x7F:
+        out.append((val & 0x7F) | 0x80)
+        val >>= 7
+    out.append(val)
+    return bytes(out)
+
+
+def _encode_proto_bytes(field_no: int, payload: bytes) -> bytes:
+    return _encode_proto_varint((field_no << 3) | 2) + _encode_proto_varint(len(payload)) + payload
+
+
+def verify_stored_credential_with_login5(username: str, credentials_b64: str) -> tuple[bool, Optional[str]]:
+    """
+    Verifies that a stored (username, credentials_b64) pair is accepted by Spotify's
+    https://login5.spotify.com/v3/login endpoint for Keymaster (65b708073fc0480ea92a077233ca87bd).
+    Returns (True, None) if valid or if network is unreachable, and (False, reason) if
+    Spotify Login5 explicitly rejects the credential (e.g. error=1 INVALID_CREDENTIALS).
+    """
+    cache_key = hashlib.sha256(f"{username}:{credentials_b64}".encode("utf-8")).hexdigest()
+    cached = _LOGIN5_VERIFICATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    try:
+        raw_cred = base64.b64decode(credentials_b64)
+    except Exception as exc:
+        return False, f"credentials field is not valid base64: {exc}"
+
+    try:
+        client_info = (
+            _encode_proto_bytes(1, ZOTIFY_KEYMASTER_CLIENT_ID.encode("utf-8"))
+            + _encode_proto_bytes(2, b"0123456789abcdef0123456789abcdef01234567")
+        )
+        stored_cred = (
+            _encode_proto_bytes(1, username.encode("utf-8"))
+            + _encode_proto_bytes(2, raw_cred)
+        )
+        login5_req = _encode_proto_bytes(1, client_info) + _encode_proto_bytes(100, stored_cred)
+        resp = requests.post(
+            "https://login5.spotify.com/v3/login",
+            data=login5_req,
+            headers={
+                "Content-Type": "application/x-protobuf",
+                "Accept": "application/x-protobuf",
+            },
+            timeout=10,
+        )
+        if resp.status_code == 200 and resp.content:
+            first_byte = resp.content[0]
+            # In LoginResponse protobuf:
+            # field 1 (tag 0x0a) is `LoginOk ok`
+            # field 2 (tag 0x10) is `LoginError error` (e.g. 0x10 0x01 = INVALID_CREDENTIALS)
+            if first_byte == 0x0A:
+                res = (True, None)
+                _LOGIN5_VERIFICATION_CACHE[cache_key] = res
+                return res
+            if first_byte == 0x10 and len(resp.content) >= 2:
+                err_code = resp.content[1]
+                err_names = {
+                    1: "INVALID_CREDENTIALS",
+                    2: "BAD_REQUEST",
+                    3: "UNSUPPORTED_LOGIN_PROTOCOL",
+                    4: "TIMEOUT",
+                    5: "UNKNOWN_IDENTIFIER",
+                    6: "TOO_MANY_ATTEMPTS",
+                    7: "INVALID_PHONENUMBER",
+                    8: "TRY_AGAIN_LATER",
+                }
+                err_label = err_names.get(err_code, f"ERROR_{err_code}")
+                reason = (
+                    f"Spotify Login5 rejected stored credential with {err_label} (code={err_code}). "
+                    "This happens when credentials.json was generated from a custom Spotify Developer Client ID "
+                    "instead of Spotify's Keymaster Client ID (65b708073fc0480ea92a077233ca87bd). "
+                    "Please use Option B (Step 1 & Step 2) in Config -> Zotify Login5 Credential Generator."
+                )
+                res = (False, reason)
+                _LOGIN5_VERIFICATION_CACHE[cache_key] = res
+                return res
+    except Exception as exc:
+        logger.debug(f"Login5 online verification skipped due to network error: {exc}")
+
+    return True, None
 
 
 def inspect_and_normalize_zotify_credentials(path: Path) -> Dict[str, Any]:
     """
-    Validates a Zotify Login5 credentials.json file and automatically upgrades
+    Validates a Zotify Login5 credentials.json file, automatically upgrades
     legacy librespot keys ('auth_data' / 'auth_type') to Googolplexed0/zotify's
-    required keys ('credentials' / 'type').
+    required keys ('credentials' / 'type'), and verifies that Spotify Login5
+    accepts the stored credential.
     """
     exists = path.exists() and path.is_file()
     size = path.stat().st_size if exists else 0
@@ -867,6 +956,25 @@ def inspect_and_normalize_zotify_credentials(path: Path) -> Dict[str, Any]:
                 ),
             }
 
+        login5_ok, login5_err = verify_stored_credential_with_login5(username, credentials_b64)
+        if not login5_ok:
+            # Quarantine/clear the non-Keymaster credential so it doesn't show a false VALID badge
+            try:
+                path.write_text("", encoding="utf-8")
+                for mirror in (ZOTIFY_CREDENTIALS_PATH, DATA_DIR / "credentials.json", Path("/app/data/credentials.json"), Path("/data/credentials.json")):
+                    if mirror.exists() and mirror.is_file():
+                        mirror.write_text("", encoding="utf-8")
+            except Exception:
+                pass
+            return {
+                "exists": True,
+                "valid": False,
+                "username": username,
+                "path": str(path),
+                "size": 0,
+                "error": login5_err,
+            }
+
         return {
             "exists": True,
             "valid": True,
@@ -897,41 +1005,52 @@ def _mirror_credentials_file(source_path: Path) -> None:
             pass
 
 
+LIBRESPOT_AP_FALLBACK_SNIPPET = (
+    "import socket\n"
+    "from librespot.core import Session, ApResolver\n"
+    "_orig_conn_create = Session.ConnectionHolder.create\n"
+    "@staticmethod\n"
+    "def _resilient_conn_create(address, conf):\n"
+    "    candidates = [address] if address else []\n"
+    "    try:\n"
+    "        pool = ApResolver.request('accesspoint').get('accesspoint', [])\n"
+    "        preferred = sorted(pool, key=lambda a: 0 if a.endswith(':443') else (1 if a.endswith(':4070') else 2))\n"
+    "        for p in preferred:\n"
+    "            if p not in candidates:\n"
+    "                candidates.append(p)\n"
+    "    except Exception:\n"
+    "        pass\n"
+    "    for fb in ('ap-gue1.spotify.com:443', 'ap-gue1.spotify.com:4070', 'ap-guc3.spotify.com:4070', 'ap-gew1.spotify.com:443'):\n"
+    "        if fb not in candidates:\n"
+    "            candidates.append(fb)\n"
+    "    last_err = None\n"
+    "    for cand in candidates:\n"
+    "        try:\n"
+    "            host, port_s = cand.split(':')\n"
+    "            sock = socket.socket()\n"
+    "            sock.settimeout(8.0)\n"
+    "            sock.connect((host, int(port_s)))\n"
+    "            sock.settimeout(None)\n"
+    "            return Session.ConnectionHolder(sock)\n"
+    "        except Exception as e:\n"
+    "            last_err = e\n"
+    "    raise last_err\n"
+    "Session.ConnectionHolder.create = _resilient_conn_create\n"
+)
+
+
 def bootstrap_zotify_login5_from_access_token(access_token: str, target_path: Path) -> Dict[str, Any]:
     """
     Uses Googolplexed0/librespot-python in a clean subprocess to exchange a Spotify
-    OAuth access_token for reusable AP credentials (ap_welcome.reusable_auth_credentials)
-    and saves them to target_path. Bridges TokenProvider.login5 with the OAuth token so
-    non-Keymaster PKCE tokens do not crash during DealerClient.connect().
+    Keymaster OAuth access_token for reusable Login5 AP credentials and saves them to target_path.
     """
     target_path.parent.mkdir(parents=True, exist_ok=True)
     helper_code = (
         "import json, os, sys\n"
-        "from librespot.core import Session, TokenProvider, DealerClient\n"
-        "from librespot.proto import Authentication_pb2 as Authentication\n"
+        + LIBRESPOT_AP_FALLBACK_SNIPPET
+        + "from librespot.proto import Authentication_pb2 as Authentication\n"
         "token = os.environ['ZOTIFY_BOOT_TOKEN']\n"
         "out_path = os.environ['ZOTIFY_BOOT_OUT']\n"
-        "_orig_login5 = TokenProvider.login5\n"
-        "def _patched_login5(self, scopes):\n"
-        "    try:\n"
-        "        res = _orig_login5(self, scopes)\n"
-        "        if res is not None:\n"
-        "            return res\n"
-        "    except Exception:\n"
-        "        pass\n"
-        "    return TokenProvider.StoredToken({\n"
-        "        'expiresIn': 3600,\n"
-        "        'accessToken': token,\n"
-        "        'scope': list(scopes) if scopes else ['playlist-read'],\n"
-        "    })\n"
-        "TokenProvider.login5 = _patched_login5\n"
-        "_orig_dealer_connect = DealerClient.connect\n"
-        "def _safe_dealer_connect(self):\n"
-        "    try:\n"
-        "        return _orig_dealer_connect(self)\n"
-        "    except Exception:\n"
-        "        return None\n"
-        "DealerClient.connect = _safe_dealer_connect\n"
         "builder = Session.Builder()\n"
         "builder.conf.store_credentials = False\n"
         "builder.login_credentials = Authentication.LoginCredentials(\n"
@@ -959,7 +1078,7 @@ def bootstrap_zotify_login5_from_access_token(access_token: str, target_path: Pa
         stderr=subprocess.PIPE,
         text=True,
         env=env,
-        timeout=30,
+        timeout=35,
         check=False,
     )
     if res.returncode != 0:
@@ -967,7 +1086,7 @@ def bootstrap_zotify_login5_from_access_token(access_token: str, target_path: Pa
         raise RuntimeError(f"librespot Session.Builder().create() failed (exit={res.returncode}): {err_out}")
     status = inspect_and_normalize_zotify_credentials(target_path)
     if not status.get("valid"):
-        raise RuntimeError(status.get("error") or "Generated credentials.json failed validation.")
+        raise RuntimeError(status.get("error") or "Generated credentials.json failed Login5 verification.")
     _mirror_credentials_file(target_path)
     return status
 
@@ -1001,17 +1120,19 @@ def prepare_zotify_credentials() -> Path:
         except Exception:
             continue
 
-    # Programmatic fallback: if credentials.json is still missing/invalid and spotify_token.json exists,
-    # refresh the active Spotify OAuth access_token and exchange it for reusable AP credentials automatically.
-    acc_tok = get_valid_spotify_access_token()
-    if acc_tok:
+    # Only auto-bootstrap from spotify_token.json if spotify_token.json was issued to Keymaster
+    if SPOTIFY_TOKEN_PATH.exists():
         try:
-            status = bootstrap_zotify_login5_from_access_token(acc_tok, ZOTIFY_CREDENTIALS_PATH)
-            logger.info(
-                f"Auto-provisioned {ZOTIFY_CREDENTIALS_PATH} from existing Spotify OAuth token (user: {status.get('username')})."
-            )
+            tok_data = json.loads(SPOTIFY_TOKEN_PATH.read_text(encoding="utf-8"))
+            if tok_data.get("client_id") == ZOTIFY_KEYMASTER_CLIENT_ID:
+                acc_tok = get_valid_spotify_access_token(ZOTIFY_KEYMASTER_CLIENT_ID)
+                if acc_tok:
+                    status = bootstrap_zotify_login5_from_access_token(acc_tok, ZOTIFY_CREDENTIALS_PATH)
+                    logger.info(
+                        f"Auto-provisioned {ZOTIFY_CREDENTIALS_PATH} from Keymaster token (user: {status.get('username')})."
+                    )
         except Exception as exc:
-            logger.warning(f"Auto-bootstrap of {ZOTIFY_CREDENTIALS_PATH} from spotify_token.json failed: {exc}")
+            logger.debug(f"Auto-bootstrap of {ZOTIFY_CREDENTIALS_PATH} skipped: {exc}")
 
     return ZOTIFY_CREDENTIALS_PATH
 
@@ -1019,39 +1140,8 @@ def prepare_zotify_credentials() -> Path:
 ZOTIFY_RUNNER_WRAPPER = (
     "import json, os, sys\n"
     "try:\n"
-    "    from librespot.core import TokenProvider, DealerClient\n"
-    "    _orig_login5 = TokenProvider.login5\n"
-    "    def _patched_login5(self, scopes):\n"
-    "        try:\n"
-    "            res = _orig_login5(self, scopes)\n"
-    "            if res is not None:\n"
-    "                return res\n"
-    "        except Exception:\n"
-    "            pass\n"
-    "        fb = os.environ.get('ZOTIFY_FALLBACK_ACCESS_TOKEN', '').strip()\n"
-    "        if not fb:\n"
-    "            tok_path = os.environ.get('SPOTIFY_TOKEN_PATH', '/app/data/spotify_token.json')\n"
-    "            if os.path.exists(tok_path):\n"
-    "                try:\n"
-    "                    fb = json.load(open(tok_path, 'r', encoding='utf-8')).get('access_token', '').strip()\n"
-    "                except Exception:\n"
-    "                    pass\n"
-    "        if fb:\n"
-    "            return TokenProvider.StoredToken({\n"
-    "                'expiresIn': 3600,\n"
-    "                'accessToken': fb,\n"
-    "                'scope': list(scopes) if scopes else ['playlist-read'],\n"
-    "            })\n"
-    "        return None\n"
-    "    TokenProvider.login5 = _patched_login5\n"
-    "    _orig_dealer_connect = DealerClient.connect\n"
-    "    def _safe_dealer_connect(self):\n"
-    "        try:\n"
-    "            return _orig_dealer_connect(self)\n"
-    "        except Exception:\n"
-    "            return None\n"
-    "    DealerClient.connect = _safe_dealer_connect\n"
-    "except Exception:\n"
+    + "\n".join("    " + line for line in LIBRESPOT_AP_FALLBACK_SNIPPET.splitlines())
+    + "\nexcept Exception:\n"
     "    pass\n"
     "from zotify.__main__ import main\n"
     "sys.argv = ['zotify'] + sys.argv[1:]\n"
@@ -1075,7 +1165,6 @@ def download_track_with_zotify(
     creds_file_obj = creds_path or prepare_zotify_credentials()
     cred_status = inspect_and_normalize_zotify_credentials(creds_file_obj)
     if not cred_status.get("valid"):
-        # Try one more time via prepare_zotify_credentials in case spotify_token.json can bootstrap it now
         creds_file_obj = prepare_zotify_credentials()
         cred_status = inspect_and_normalize_zotify_credentials(creds_file_obj)
 
@@ -1088,9 +1177,8 @@ def download_track_with_zotify(
             f"Track: '{track_title}' ({track_id})\n"
             f"Credentials: {credentials_file} (exists={creds_exists}, size={creds_size}B, valid=False)\n"
             f"Reason: {cred_status.get('error')}\n"
-            f"Resolution: Headless Docker containers cannot complete Zotify's interactive 127.0.0.1:4381 login automatically.\n"
-            f"Open 'Config' or 'Logs' in the Yotofy Web UI and use the 'Zotify Login5 Credential Generator' "
-            f"to authenticate and save {credentials_file} in 2 clicks."
+            f"Resolution: Open 'Config' -> 'Googolplexed0/zotify Login5 Credentials' and use "
+            f"'Option B (Step 1 & Step 2)' to generate a valid Keymaster Login5 {credentials_file}."
         )
         logger.error(
             f"Zotify aborted for '{track_title}' ({track_id}): {cred_status.get('error')}",
@@ -1103,6 +1191,8 @@ def download_track_with_zotify(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    # IMPORTANT: --standard-interface MUST be False so Googolplexed0/zotify prints all
+    # warnings, API errors, skips, and download confirmations to stdout instead of calling `clear`.
     zotify_args = [
         f"https://open.spotify.com/track/{track_id}",
         "--config-location",
@@ -1116,7 +1206,7 @@ def download_track_with_zotify(
         "--download-format",
         "mp3",
         "--download-quality",
-        "very_high",
+        "auto",
         "--lyrics-to-file",
         "False",
         "--lyrics-to-metadata",
@@ -1128,24 +1218,31 @@ def download_track_with_zotify(
         "--skip-previously-downloaded",
         "False",
         "--standard-interface",
+        "False",
+        "--print-warnings",
+        "True",
+        "--print-errors",
+        "True",
+        "--print-api-errors",
+        "True",
+        "--print-downloads",
+        "True",
+        "--print-skips",
         "True",
         "--redirect-timeout",
         "1.0",
         "--retry-attempts",
-        "0",
+        "2",
     ]
     cmd = [sys.executable, "-c", ZOTIFY_RUNNER_WRAPPER, *zotify_args]
     cmd_str = f"{sys.executable} -m zotify " + " ".join(zotify_args)
-
-    fallback_access_token = get_valid_spotify_access_token() or ""
 
     logger.info(
         f"Downloading '{track_title}' ({track_id}) via Googolplexed0/zotify...",
         extra={
             "details": (
                 f"Command: {cmd_str}\n"
-                f"Credentials: {credentials_file} (user={cred_status.get('username')}, size={creds_size}B)\n"
-                f"OAuth Token Bridge: {'enabled' if fallback_access_token else 'none'}\n"
+                f"Credentials: {credentials_file} (user={cred_status.get('username')}, size={creds_size}B, login5_verified=True)\n"
                 f"Temp Dir: {tmp_dir}"
             )
         },
@@ -1155,8 +1252,7 @@ def download_track_with_zotify(
         env = {
             **os.environ,
             "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python",
-            "ZOTIFY_FALLBACK_ACCESS_TOKEN": fallback_access_token,
-            "SPOTIFY_TOKEN_PATH": str(SPOTIFY_TOKEN_PATH),
+            "TERM": "xterm",
         }
         res = subprocess.run(
             cmd,
@@ -1410,6 +1506,10 @@ def spotify_pkce_exchange(payload: SpotifyPkceRequest, request: Request):
             detail="Spotify Client ID is required for PKCE token exchange.",
         )
 
+    now = time.time()
+    if payload.code in _CONSUMED_PKCE_CODES and now - _CONSUMED_PKCE_CODES[payload.code] < 60:
+        return {"status": "ok", "spotifyUser": get_spotify_user_profile(client_id)}
+
     state = store.load()
     state.setdefault("settings", dict(DEFAULT_SETTINGS))["spotifyClientId"] = client_id
     store.save(state)
@@ -1429,9 +1529,14 @@ def spotify_pkce_exchange(payload: SpotifyPkceRequest, request: Request):
         )
         if resp.status_code != 200:
             err_text = resp.text
+            if "invalid_grant" in err_text and SPOTIFY_TOKEN_PATH.exists():
+                existing_prof = get_spotify_user_profile(client_id)
+                if existing_prof:
+                    return {"status": "ok", "spotifyUser": existing_prof}
             store.add_activity("System", "Spotify PKCE token exchange failed", "error", err_text)
             raise HTTPException(status_code=400, detail=f"Spotify PKCE token exchange failed: {err_text}")
 
+        _CONSUMED_PKCE_CODES[payload.code] = now
         token_info = resp.json()
         saved_token = {
             **token_info,
@@ -1445,15 +1550,6 @@ def spotify_pkce_exchange(payload: SpotifyPkceRequest, request: Request):
 
         profile = get_spotify_user_profile(client_id)
         display_name = profile.get("display_name") if profile else "Spotify User"
-
-        # Programmatically attempt to provision Zotify Login5 credentials.json from the new PKCE token
-        acc_tok = token_info.get("access_token")
-        if acc_tok:
-            try:
-                bootstrap_zotify_login5_from_access_token(acc_tok, ZOTIFY_CREDENTIALS_PATH)
-                logger.info(f"Auto-provisioned {ZOTIFY_CREDENTIALS_PATH} during Spotify PKCE login.")
-            except Exception as boot_exc:
-                logger.info(f"Note: Spotify PKCE token could not directly bootstrap Login5 ({boot_exc}); Keymaster flow available in Config.")
 
         store.add_activity(
             "System",
@@ -1541,6 +1637,12 @@ def yoto_pkce_exchange(payload: YotoPkceRequest, request: Request):
             detail="Yoto Client ID is required for PKCE token exchange.",
         )
 
+    now = time.time()
+    if payload.code in _CONSUMED_PKCE_CODES and now - _CONSUMED_PKCE_CODES[payload.code] < 60:
+        verified, profile, cards = verify_yoto_connection_via_mine(client_id)
+        if verified:
+            return {"status": "ok", "yotoUser": profile, "yotoCards": cards}
+
     state = store.load()
     state.setdefault("settings", dict(DEFAULT_SETTINGS))["yotoClientId"] = client_id
     store.save(state)
@@ -1560,9 +1662,14 @@ def yoto_pkce_exchange(payload: YotoPkceRequest, request: Request):
         )
         if resp.status_code != 200:
             err_text = resp.text
+            if "invalid_grant" in err_text and YOTO_TOKEN_PATH.exists():
+                verified, profile, cards = verify_yoto_connection_via_mine(client_id)
+                if verified:
+                    return {"status": "ok", "yotoUser": profile, "yotoCards": cards}
             store.add_activity("System", "Yoto PKCE token exchange failed", "error", err_text)
             raise HTTPException(status_code=400, detail=f"Yoto PKCE token exchange failed: {err_text}")
 
+        _CONSUMED_PKCE_CODES[payload.code] = now
         token_json = resp.json()
         access_token = token_json.get("access_token")
         if not access_token:

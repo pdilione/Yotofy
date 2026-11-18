@@ -306,43 +306,21 @@ export const ZotifyAuthPanel: React.FC<Props> = ({
         </div>
       </div>
 
+      {!isValid && status?.error && (
+        <div className="p-3 rounded-xl bg-amber-500/15 border border-amber-500/30 text-xs text-amber-100 flex items-start gap-2">
+          <AlertCircle size={15} className="text-amber-300 shrink-0 mt-0.5" />
+          <span className="leading-relaxed">{status.error}</span>
+        </div>
+      )}
+
       {/* Programmatic & Interactive Setup Tools */}
       {showSetup && (
         <div className="bg-black/40 rounded-xl p-4 border border-white/10 space-y-4">
-          {/* Option A: 1-Click Programmatic Auto-Provisioning */}
-          <div className="p-3.5 rounded-xl bg-emerald-500/[0.06] border border-emerald-500/25 flex flex-wrap items-center justify-between gap-3">
-            <div className="space-y-0.5 max-w-xl">
-              <div className="flex items-center gap-1.5 text-xs font-bold text-emerald-300">
-                <Wand2 size={14} />
-                <span>Option A (Automatic) — Provision from Connected Spotify Account</span>
-              </div>
-              <p className="text-xs text-gray-300 leading-relaxed">
-                Tries to programmatically convert your active Spotify OAuth token (
-                <code>spotify_token.json</code>) into a reusable Zotify Login5 session at{' '}
-                <code>{credPath}</code>. If Spotify&apos;s Access Point requires a Keymaster
-                token instead, use Option B right below.
-              </p>
-            </div>
-            <button
-              type="button"
-              onClick={handleAutoProvisionFromSpotify}
-              disabled={autoProvisioning || busy}
-              className="px-4 py-2.5 rounded-lg bg-emerald-500 hover:bg-emerald-400 text-black font-bold text-xs flex items-center gap-2 transition-colors disabled:opacity-50 shrink-0"
-            >
-              <Wand2 size={14} />
-              <span>
-                {autoProvisioning
-                  ? 'Provisioning Login5 Session...'
-                  : 'Try 1-Click Auto-Provision'}
-              </span>
-            </button>
-          </div>
-
-          {/* Option B: 2-Step Headless NAS / Docker Keymaster PKCE Generator */}
+          {/* Primary Recommended: 2-Step Headless NAS / Docker Keymaster PKCE Generator */}
           <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <span className="text-xs font-bold text-white uppercase tracking-wider">
-                Option B (Headless NAS / Docker) — 2-Click Keymaster PKCE Generator
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs font-bold text-spotify-green uppercase tracking-wider">
+                Recommended (Headless NAS / Docker) — 2-Click Keymaster PKCE Generator
               </span>
               {waitingForCallback && (
                 <span className="text-[11px] font-mono text-spotify-green flex items-center gap-1.5">
@@ -409,7 +387,7 @@ export const ZotifyAuthPanel: React.FC<Props> = ({
                       http://127.0.0.1:4381/login?code=AQB...
                     </code>{' '}
                     URL from your browser&apos;s address bar and either click{' '}
-                    <strong>Paste from Clipboard &amp; Save</strong> or paste it into the box:
+                    <strong>Paste Clipboard &amp; Save</strong> or paste it into the box:
                   </p>
                   <input
                     type="text"
@@ -447,8 +425,8 @@ export const ZotifyAuthPanel: React.FC<Props> = ({
             </div>
           </div>
 
-          {/* Option C: Direct JSON Paste */}
-          <div className="pt-2 border-t border-white/10">
+          {/* Alternative Options: Direct JSON Paste & Token Auto-Provision */}
+          <div className="pt-3 border-t border-white/10 flex flex-wrap items-center justify-between gap-3">
             <button
               type="button"
               onClick={() => setShowRawJsonMode(!showRawJsonMode)}
@@ -458,30 +436,44 @@ export const ZotifyAuthPanel: React.FC<Props> = ({
               <span>
                 {showRawJsonMode
                   ? 'Hide manual credentials.json paste'
-                  : 'Option C — Already have a credentials.json file? Click to paste JSON directly'}
+                  : 'Already have a Keymaster credentials.json file? Click to paste JSON directly'}
               </span>
             </button>
 
-            {showRawJsonMode && (
-              <div className="mt-3 space-y-2">
-                <textarea
-                  rows={4}
-                  value={rawJsonInput}
-                  onChange={(e) => setRawJsonInput(e.target.value)}
-                  placeholder='{"username": "your_spotify_username", "credentials": "base64_reusable_credentials...", "type": "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS"}'
-                  className="w-full bg-black/60 border border-white/20 rounded-lg p-3 text-xs text-white font-mono placeholder-gray-500 focus:border-yoto-orange focus:outline-none"
-                />
-                <button
-                  type="button"
-                  onClick={handleSaveRawJson}
-                  disabled={busy || !rawJsonInput.trim()}
-                  className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-bold transition-colors disabled:opacity-50"
-                >
-                  Save Pasted credentials.json
-                </button>
-              </div>
-            )}
+            <button
+              type="button"
+              onClick={handleAutoProvisionFromSpotify}
+              disabled={autoProvisioning || busy}
+              className="px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 border border-white/10 text-gray-300 text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50"
+            >
+              <Wand2 size={12} className="text-emerald-400" />
+              <span>
+                {autoProvisioning
+                  ? 'Testing Spotify Token...'
+                  : 'Test Auto-Provision from spotify_token.json'}
+              </span>
+            </button>
           </div>
+
+          {showRawJsonMode && (
+            <div className="space-y-2">
+              <textarea
+                rows={4}
+                value={rawJsonInput}
+                onChange={(e) => setRawJsonInput(e.target.value)}
+                placeholder='{"username": "your_spotify_username", "credentials": "base64_reusable_credentials...", "type": "AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS"}'
+                className="w-full bg-black/60 border border-white/20 rounded-lg p-3 text-xs text-white font-mono placeholder-gray-500 focus:border-yoto-orange focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={handleSaveRawJson}
+                disabled={busy || !rawJsonInput.trim()}
+                className="px-4 py-2 rounded-lg bg-white/10 hover:bg-white/20 text-white text-xs font-bold transition-colors disabled:opacity-50"
+              >
+                Save &amp; Verify Pasted credentials.json
+              </button>
+            </div>
+          )}
         </div>
       )}
 
