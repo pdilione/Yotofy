@@ -133,15 +133,22 @@ class StateStore:
         }
 
     def _ensure_initialized(self) -> None:
-        if not self.path.exists():
+        if not self.path.exists() or self.path.stat().st_size == 0:
             self.save(self._default_state())
 
     def load(self) -> Dict[str, Any]:
         self._ensure_initialized()
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
+            raw = self.path.read_text(encoding="utf-8").strip()
+            if not raw:
+                default_st = self._default_state()
+                self.save(default_st)
+                return default_st
+            data = json.loads(raw)
             if not isinstance(data, dict):
-                return self._default_state()
+                default_st = self._default_state()
+                self.save(default_st)
+                return default_st
             data.setdefault("tracks", {})
             data.setdefault("playlists", {})
             data.setdefault("activity", [])
@@ -149,11 +156,28 @@ class StateStore:
             return data
         except Exception as exc:
             logger.warning(f"Failed to read {self.path}, resetting state: {exc}")
-            return self._default_state()
+            default_st = self._default_state()
+            try:
+                self.save(default_st)
+            except Exception:
+                pass
+            return default_st
 
     def save(self, state: Dict[str, Any]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        serialized = json.dumps(state, indent=2)
+        tmp_path = self.path.with_suffix(".json.tmp")
+        try:
+            tmp_path.write_text(serialized, encoding="utf-8")
+            os.replace(str(tmp_path), str(self.path))
+        except OSError:
+            # Fallback if self.path is a direct single-file Docker bind mount (EBUSY on os.replace)
+            self.path.write_text(serialized, encoding="utf-8")
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except OSError:
+                pass
 
     def add_activity(
         self,
@@ -861,18 +885,53 @@ def inspect_and_normalize_zotify_credentials(path: Path) -> Dict[str, Any]:
         }
 
 
+def _mirror_credentials_file(source_path: Path) -> None:
+    """Ensures /app/data/credentials.json and /data/credentials.json stay in sync when both paths exist."""
+    if not source_path.exists() or source_path.stat().st_size == 0:
+        return
+    for mirror in (ZOTIFY_CREDENTIALS_PATH, DATA_DIR / "credentials.json", Path("/app/data/credentials.json"), Path("/data/credentials.json")):
+        try:
+            if mirror.parent.exists() and mirror.resolve() != source_path.resolve():
+                shutil.copyfile(str(source_path), str(mirror))
+        except Exception:
+            pass
+
+
 def bootstrap_zotify_login5_from_access_token(access_token: str, target_path: Path) -> Dict[str, Any]:
     """
     Uses Googolplexed0/librespot-python in a clean subprocess to exchange a Spotify
-    OAuth access_token for reusable Login5 AP credentials and saves them to target_path.
+    OAuth access_token for reusable AP credentials (ap_welcome.reusable_auth_credentials)
+    and saves them to target_path. Bridges TokenProvider.login5 with the OAuth token so
+    non-Keymaster PKCE tokens do not crash during DealerClient.connect().
     """
     target_path.parent.mkdir(parents=True, exist_ok=True)
     helper_code = (
         "import json, os, sys\n"
-        "from librespot.core import Session\n"
+        "from librespot.core import Session, TokenProvider, DealerClient\n"
         "from librespot.proto import Authentication_pb2 as Authentication\n"
         "token = os.environ['ZOTIFY_BOOT_TOKEN']\n"
         "out_path = os.environ['ZOTIFY_BOOT_OUT']\n"
+        "_orig_login5 = TokenProvider.login5\n"
+        "def _patched_login5(self, scopes):\n"
+        "    try:\n"
+        "        res = _orig_login5(self, scopes)\n"
+        "        if res is not None:\n"
+        "            return res\n"
+        "    except Exception:\n"
+        "        pass\n"
+        "    return TokenProvider.StoredToken({\n"
+        "        'expiresIn': 3600,\n"
+        "        'accessToken': token,\n"
+        "        'scope': list(scopes) if scopes else ['playlist-read'],\n"
+        "    })\n"
+        "TokenProvider.login5 = _patched_login5\n"
+        "_orig_dealer_connect = DealerClient.connect\n"
+        "def _safe_dealer_connect(self):\n"
+        "    try:\n"
+        "        return _orig_dealer_connect(self)\n"
+        "    except Exception:\n"
+        "        return None\n"
+        "DealerClient.connect = _safe_dealer_connect\n"
         "builder = Session.Builder()\n"
         "builder.conf.store_credentials = False\n"
         "builder.login_credentials = Authentication.LoginCredentials(\n"
@@ -909,6 +968,7 @@ def bootstrap_zotify_login5_from_access_token(access_token: str, target_path: Pa
     status = inspect_and_normalize_zotify_credentials(target_path)
     if not status.get("valid"):
         raise RuntimeError(status.get("error") or "Generated credentials.json failed validation.")
+    _mirror_credentials_file(target_path)
     return status
 
 
@@ -918,11 +978,13 @@ def prepare_zotify_credentials() -> Path:
         ZOTIFY_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
         ZOTIFY_CREDENTIALS_PATH.write_text(creds_json.strip(), encoding="utf-8")
         inspect_and_normalize_zotify_credentials(ZOTIFY_CREDENTIALS_PATH)
+        _mirror_credentials_file(ZOTIFY_CREDENTIALS_PATH)
         return ZOTIFY_CREDENTIALS_PATH
 
     candidate_paths = [
         ZOTIFY_CREDENTIALS_PATH,
         DATA_DIR / "credentials.json",
+        Path("/app/data/credentials.json"),
         Path("/data/credentials.json"),
         Path.home() / ".config" / "zotify" / "credentials.json",
         Path.home() / ".local" / "share" / "zotify" / "credentials.json",
@@ -934,25 +996,67 @@ def prepare_zotify_credentials() -> Path:
                 if cand.resolve() != ZOTIFY_CREDENTIALS_PATH.resolve():
                     ZOTIFY_CREDENTIALS_PATH.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(str(cand), str(ZOTIFY_CREDENTIALS_PATH))
+                _mirror_credentials_file(ZOTIFY_CREDENTIALS_PATH)
                 return ZOTIFY_CREDENTIALS_PATH
         except Exception:
             continue
 
     # Programmatic fallback: if credentials.json is still missing/invalid and spotify_token.json exists,
-    # attempt to exchange the active Spotify OAuth access_token for a reusable Login5 session automatically.
-    if SPOTIFY_TOKEN_PATH.exists():
+    # refresh the active Spotify OAuth access_token and exchange it for reusable AP credentials automatically.
+    acc_tok = get_valid_spotify_access_token()
+    if acc_tok:
         try:
-            tok_data = json.loads(SPOTIFY_TOKEN_PATH.read_text(encoding="utf-8"))
-            acc_tok = tok_data.get("access_token")
-            if acc_tok:
-                bootstrap_zotify_login5_from_access_token(acc_tok, ZOTIFY_CREDENTIALS_PATH)
-                logger.info(
-                    f"Auto-provisioned {ZOTIFY_CREDENTIALS_PATH} from existing Spotify OAuth token."
-                )
+            status = bootstrap_zotify_login5_from_access_token(acc_tok, ZOTIFY_CREDENTIALS_PATH)
+            logger.info(
+                f"Auto-provisioned {ZOTIFY_CREDENTIALS_PATH} from existing Spotify OAuth token (user: {status.get('username')})."
+            )
         except Exception as exc:
-            logger.debug(f"Auto-bootstrap from spotify_token.json skipped: {exc}")
+            logger.warning(f"Auto-bootstrap of {ZOTIFY_CREDENTIALS_PATH} from spotify_token.json failed: {exc}")
 
     return ZOTIFY_CREDENTIALS_PATH
+
+
+ZOTIFY_RUNNER_WRAPPER = (
+    "import json, os, sys\n"
+    "try:\n"
+    "    from librespot.core import TokenProvider, DealerClient\n"
+    "    _orig_login5 = TokenProvider.login5\n"
+    "    def _patched_login5(self, scopes):\n"
+    "        try:\n"
+    "            res = _orig_login5(self, scopes)\n"
+    "            if res is not None:\n"
+    "                return res\n"
+    "        except Exception:\n"
+    "            pass\n"
+    "        fb = os.environ.get('ZOTIFY_FALLBACK_ACCESS_TOKEN', '').strip()\n"
+    "        if not fb:\n"
+    "            tok_path = os.environ.get('SPOTIFY_TOKEN_PATH', '/app/data/spotify_token.json')\n"
+    "            if os.path.exists(tok_path):\n"
+    "                try:\n"
+    "                    fb = json.load(open(tok_path, 'r', encoding='utf-8')).get('access_token', '').strip()\n"
+    "                except Exception:\n"
+    "                    pass\n"
+    "        if fb:\n"
+    "            return TokenProvider.StoredToken({\n"
+    "                'expiresIn': 3600,\n"
+    "                'accessToken': fb,\n"
+    "                'scope': list(scopes) if scopes else ['playlist-read'],\n"
+    "            })\n"
+    "        return None\n"
+    "    TokenProvider.login5 = _patched_login5\n"
+    "    _orig_dealer_connect = DealerClient.connect\n"
+    "    def _safe_dealer_connect(self):\n"
+    "        try:\n"
+    "            return _orig_dealer_connect(self)\n"
+    "        except Exception:\n"
+    "            return None\n"
+    "    DealerClient.connect = _safe_dealer_connect\n"
+    "except Exception:\n"
+    "    pass\n"
+    "from zotify.__main__ import main\n"
+    "sys.argv = ['zotify'] + sys.argv[1:]\n"
+    "main()\n"
+)
 
 
 def download_track_with_zotify(
@@ -970,6 +1074,11 @@ def download_track_with_zotify(
 
     creds_file_obj = creds_path or prepare_zotify_credentials()
     cred_status = inspect_and_normalize_zotify_credentials(creds_file_obj)
+    if not cred_status.get("valid"):
+        # Try one more time via prepare_zotify_credentials in case spotify_token.json can bootstrap it now
+        creds_file_obj = prepare_zotify_credentials()
+        cred_status = inspect_and_normalize_zotify_credentials(creds_file_obj)
+
     credentials_file = str(creds_file_obj)
     creds_exists = cred_status["exists"]
     creds_size = cred_status["size"]
@@ -994,10 +1103,7 @@ def download_track_with_zotify(
     tmp_dir.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "zotify",
+    zotify_args = [
         f"https://open.spotify.com/track/{track_id}",
         "--config-location",
         str(DATA_DIR),
@@ -1028,7 +1134,10 @@ def download_track_with_zotify(
         "--retry-attempts",
         "0",
     ]
-    cmd_str = " ".join(cmd)
+    cmd = [sys.executable, "-c", ZOTIFY_RUNNER_WRAPPER, *zotify_args]
+    cmd_str = f"{sys.executable} -m zotify " + " ".join(zotify_args)
+
+    fallback_access_token = get_valid_spotify_access_token() or ""
 
     logger.info(
         f"Downloading '{track_title}' ({track_id}) via Googolplexed0/zotify...",
@@ -1036,13 +1145,19 @@ def download_track_with_zotify(
             "details": (
                 f"Command: {cmd_str}\n"
                 f"Credentials: {credentials_file} (user={cred_status.get('username')}, size={creds_size}B)\n"
+                f"OAuth Token Bridge: {'enabled' if fallback_access_token else 'none'}\n"
                 f"Temp Dir: {tmp_dir}"
             )
         },
     )
 
     try:
-        env = {**os.environ, "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python"}
+        env = {
+            **os.environ,
+            "PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION": "python",
+            "ZOTIFY_FALLBACK_ACCESS_TOKEN": fallback_access_token,
+            "SPOTIFY_TOKEN_PATH": str(SPOTIFY_TOKEN_PATH),
+        }
         res = subprocess.run(
             cmd,
             stdin=subprocess.DEVNULL,
