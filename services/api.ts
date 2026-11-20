@@ -18,6 +18,18 @@ export interface SystemLogsResponse {
 }
 
 
+export interface YotoTokenDiagnostics {
+  hasAccessToken: boolean;
+  hasRefreshToken: boolean;
+  isExpired: boolean;
+  expiresAt?: number | null;
+  expiresAtIso?: string | null;
+  scopes?: string;
+  permissions?: string[];
+  hasContentManageScope: boolean;
+  summary: string;
+}
+
 export interface SystemStatusResponse {
   spotify: boolean;
   yoto: boolean;
@@ -28,6 +40,7 @@ export interface SystemStatusResponse {
   spotifyUser?: ConnectedUserProfile | null;
   yotoUser?: ConnectedUserProfile | null;
   yotoCards?: YotoMyoCard[];
+  yotoTokenDiagnostics?: YotoTokenDiagnostics | null;
   cachedTracksCount?: number;
   settings?: AppSettings;
   message?: string;
@@ -58,7 +71,8 @@ export const YOTO_PKCE_RESULT_STORAGE_KEY = 'yotofy_yoto_pkce_result';
 
 export const SPOTIFY_SCOPES =
   'streaming playlist-read-private playlist-read-collaborative user-follow-read user-read-playback-position user-top-read user-read-recently-played user-library-read user-read-email user-read-private';
-export const YOTO_SCOPES = 'user:content:manage family:library:manage';
+export const YOTO_SCOPES = 'user:content:manage family:library:manage offline_access';
+export const YOTO_SCOPES_FALLBACK = 'user:content:manage family:library:manage';
 export const YOTO_AUDIENCE = 'https://api.yotoplay.com';
 export const YOTO_AUTHORIZE_ENDPOINT = 'https://login.yotoplay.com/authorize';
 export const YOTO_TOKEN_ENDPOINT = 'https://login.yotoplay.com/oauth/token';
@@ -222,7 +236,10 @@ export const exchangeSpotifyPkceCode = async (
   return data;
 };
 
-export const openYotoPkcePopup = async (clientIdInput?: string): Promise<Window | null> => {
+export const openYotoPkcePopup = async (
+  clientIdInput?: string,
+  scopesOverride?: string
+): Promise<Window | null> => {
   const clientId = (clientIdInput ?? getStoredYotoClientId()).trim();
   if (!clientId) {
     throw new Error('Please paste your Yoto Client ID first.');
@@ -243,7 +260,7 @@ export const openYotoPkcePopup = async (clientIdInput?: string): Promise<Window 
     response_type: 'code',
     redirect_uri: redirectUri,
     audience: YOTO_AUDIENCE,
-    scope: YOTO_SCOPES,
+    scope: scopesOverride || YOTO_SCOPES,
     code_challenge_method: 'S256',
     code_challenge: codeChallenge,
     state: 'yoto_pkce',

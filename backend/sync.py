@@ -11,6 +11,9 @@ import hashlib
 import base64
 import secrets
 import threading
+import io
+import zlib
+import struct
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,10 +27,16 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, RedirectResponse
+from fastapi.responses import FileResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from spotipy.oauth2 import SpotifyOAuth, SpotifyClientCredentials
 from spotipy.cache_handler import CacheFileHandler
+
+try:
+    from PIL import Image, ImageEnhance
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 # Load environment variables from .env
 load_dotenv()
@@ -128,6 +137,8 @@ class StateStore:
         return {
             "tracks": {},
             "playlists": {},
+            "icons": {},
+            "covers": {},
             "activity": [],
             "settings": dict(DEFAULT_SETTINGS),
         }
@@ -151,6 +162,8 @@ class StateStore:
                 return default_st
             data.setdefault("tracks", {})
             data.setdefault("playlists", {})
+            data.setdefault("icons", {})
+            data.setdefault("covers", {})
             data.setdefault("activity", [])
             data.setdefault("settings", dict(DEFAULT_SETTINGS))
             return data
@@ -213,18 +226,53 @@ class StateStore:
         duration_sec: int,
         file_size: int,
         local_file_path: Optional[str] = None,
+        audio_format: Optional[str] = None,
+        channels: Optional[str] = None,
+        icon_media_id: Optional[str] = None,
+        image_url: Optional[str] = None,
     ) -> None:
         state = self.load()
-        state.setdefault("tracks", {})[track_id] = {
+        existing = state.setdefault("tracks", {}).get(track_id) or {}
+        state["tracks"][track_id] = {
             "spotifyTrackId": track_id,
             "transcodedSha256": transcoded_sha256,
             "title": title,
             "artist": artist,
             "duration": duration_sec,
             "fileSize": file_size,
-            "localFilePath": local_file_path,
+            "localFilePath": local_file_path or existing.get("localFilePath"),
+            "format": audio_format or existing.get("format") or "aac",
+            "channels": channels or existing.get("channels") or "stereo",
+            "iconMediaId": icon_media_id or existing.get("iconMediaId"),
+            "imageUrl": image_url or existing.get("imageUrl"),
             "syncedAt": datetime.now(timezone.utc).isoformat(),
         }
+        self.save(state)
+
+    def get_cached_icon(self, key: str) -> Optional[str]:
+        if not key:
+            return None
+        state = self.load()
+        return (state.get("icons") or {}).get(key)
+
+    def save_cached_icon(self, key: str, media_id: str) -> None:
+        if not key or not media_id:
+            return
+        state = self.load()
+        state.setdefault("icons", {})[key] = media_id
+        self.save(state)
+
+    def get_cached_cover(self, key: str) -> Optional[str]:
+        if not key:
+            return None
+        state = self.load()
+        return (state.get("covers") or {}).get(key)
+
+    def save_cached_cover(self, key: str, media_url: str) -> None:
+        if not key or not media_url:
+            return
+        state = self.load()
+        state.setdefault("covers", {})[key] = media_url
         self.save(state)
 
 
@@ -366,7 +414,84 @@ def get_spotify_user_profile(override_client_id: Optional[str] = None) -> Option
 # =============================================================================
 # Yoto OAuth 2.0 PKCE & Token Flow (data/yoto_token.json)
 # =============================================================================
-YOTO_PKCE_SCOPES = "user:content:manage family:library:manage"
+YOTO_PKCE_SCOPES = "user:content:manage family:library:manage offline_access"
+
+
+def decode_yoto_jwt_claims(access_token: Optional[str]) -> Dict[str, Any]:
+    """Decodes the unencrypted payload segment of a Yoto OAuth JWT access_token."""
+    if not access_token or not isinstance(access_token, str):
+        return {}
+    parts = access_token.strip().split(".")
+    if len(parts) < 2:
+        return {}
+    try:
+        payload_b64 = parts[1]
+        padding = "=" * (-len(payload_b64) % 4)
+        raw_bytes = base64.urlsafe_b64decode(payload_b64 + padding)
+        parsed = json.loads(raw_bytes.decode("utf-8", errors="replace"))
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def describe_yoto_token_diagnostics(token_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Inspects data/yoto_token.json and its JWT claims to explain 401/403 errors clearly."""
+    data = token_data if token_data is not None else (load_yoto_token_data() or {})
+    access_token = (data.get("access_token") or "").strip() if isinstance(data.get("access_token"), str) else ""
+    refresh_token = (data.get("refresh_token") or "").strip() if isinstance(data.get("refresh_token"), str) else ""
+    claims = decode_yoto_jwt_claims(access_token)
+    now = int(time.time())
+
+    jwt_exp = claims.get("exp")
+    stored_exp = data.get("expires_at")
+    effective_exp: Optional[int] = None
+    if isinstance(jwt_exp, (int, float)):
+        effective_exp = int(jwt_exp)
+    elif isinstance(stored_exp, (int, float)):
+        effective_exp = int(stored_exp)
+
+    is_expired = bool(effective_exp and now >= effective_exp)
+    expires_at_iso = (
+        datetime.fromtimestamp(effective_exp, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+        if effective_exp
+        else None
+    )
+
+    jwt_scope_str = str(claims.get("scope") or data.get("scope") or "").strip()
+    jwt_permissions = claims.get("permissions") if isinstance(claims.get("permissions"), list) else []
+    scope_tokens = set(jwt_scope_str.split()) | {str(p) for p in jwt_permissions}
+    has_content_manage = "user:content:manage" in scope_tokens or not scope_tokens
+
+    if not access_token:
+        summary = "No Yoto access_token found in /data/yoto_token.json. Connect Yoto in Config."
+    elif is_expired:
+        summary = (
+            f"Yoto access_token expired at {expires_at_iso} "
+            f"(refresh_token={'present' if refresh_token else 'MISSING — offline_access scope was not granted'}). "
+            f"Open Config and click 'Reconnect Yoto' to get a fresh token."
+        )
+    elif not has_content_manage:
+        summary = (
+            f"Yoto access_token is missing the 'user:content:manage' scope (granted scopes: '{jwt_scope_str or 'none'}'). "
+            f"Enable 'user:content:manage' and 'offline_access' in your Yoto Developer Dashboard (yoto.dev) and click 'Reconnect Yoto'."
+        )
+    else:
+        summary = (
+            f"Yoto token valid until {expires_at_iso or 'unknown'} "
+            f"(scopes: '{jwt_scope_str or 'default'}', refresh_token={'yes' if refresh_token else 'no'})."
+        )
+
+    return {
+        "hasAccessToken": bool(access_token),
+        "hasRefreshToken": bool(refresh_token),
+        "isExpired": is_expired,
+        "expiresAt": effective_exp,
+        "expiresAtIso": expires_at_iso,
+        "scopes": jwt_scope_str,
+        "permissions": jwt_permissions,
+        "hasContentManageScope": has_content_manage,
+        "summary": summary,
+    }
 
 
 def get_yoto_oauth_credentials(override_client_id: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
@@ -410,27 +535,33 @@ def load_yoto_token_data() -> Optional[Dict[str, Any]]:
 def save_yoto_token_data(token_payload: Dict[str, Any]) -> Dict[str, Any]:
     YOTO_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     now = int(time.time())
+    claims = decode_yoto_jwt_claims(token_payload.get("access_token"))
+    jwt_exp = claims.get("exp")
     expires_in = token_payload.get("expires_in")
-    if expires_in and "expires_at" not in token_payload:
+    if isinstance(jwt_exp, (int, float)):
+        token_payload["expires_at"] = int(jwt_exp)
+    elif expires_in:
         token_payload["expires_at"] = now + int(expires_in)
+    if claims.get("scope") and not token_payload.get("scope"):
+        token_payload["scope"] = claims.get("scope")
     token_payload["updated_at"] = datetime.now(timezone.utc).isoformat()
     YOTO_TOKEN_PATH.write_text(json.dumps(token_payload, indent=2), encoding="utf-8")
     return token_payload
 
 
-def refresh_yoto_token_if_needed(
-    token_data: Dict[str, Any],
+def force_refresh_yoto_token(
+    token_data: Optional[Dict[str, Any]] = None,
     override_client_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
-    expires_at = token_data.get("expires_at")
-    now = int(time.time())
-    if not expires_at or now < int(expires_at) - 60:
-        return token_data
+    """Forces an immediate OAuth refresh_token exchange with login.yotoplay.com."""
+    data = token_data if token_data is not None else load_yoto_token_data()
+    if not data:
+        return None
 
-    refresh_token = token_data.get("refresh_token")
-    client_id, client_secret = get_yoto_oauth_credentials(override_client_id or token_data.get("client_id"))
+    refresh_token = data.get("refresh_token")
+    client_id, client_secret = get_yoto_oauth_credentials(override_client_id or data.get("client_id"))
     if not refresh_token or not client_id:
-        return token_data
+        return None
 
     try:
         payload: Dict[str, str] = {
@@ -438,7 +569,7 @@ def refresh_yoto_token_if_needed(
             "client_id": client_id,
             "refresh_token": refresh_token,
         }
-        if client_secret and not token_data.get("pkce"):
+        if client_secret and not data.get("pkce"):
             payload["client_secret"] = client_secret
 
         resp = requests.post(
@@ -447,26 +578,56 @@ def refresh_yoto_token_if_needed(
             headers={"Content-Type": "application/x-www-form-urlencoded"},
             timeout=20,
         )
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            logger.warning(f"Yoto token refresh rejected ({resp.status_code}): {resp.text[:300]}")
+            return None
+
         refreshed = resp.json()
         merged = {
-            **token_data,
+            **data,
             **refreshed,
             "client_id": client_id,
             "refresh_token": refreshed.get("refresh_token", refresh_token),
         }
-        return save_yoto_token_data(merged)
+        saved = save_yoto_token_data(merged)
+        logger.info("Successfully refreshed Yoto OAuth access_token via refresh_token.")
+        return saved
     except Exception as exc:
         logger.warning(f"Failed to refresh Yoto token: {exc}")
+        return None
+
+
+def refresh_yoto_token_if_needed(
+    token_data: Dict[str, Any],
+    override_client_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    diag = describe_yoto_token_diagnostics(token_data)
+    expires_at = diag.get("expiresAt")
+    now = int(time.time())
+    if expires_at and now < int(expires_at) - 120:
         return token_data
+
+    if not expires_at and not diag.get("isExpired"):
+        return token_data
+
+    refreshed = force_refresh_yoto_token(token_data, override_client_id)
+    if refreshed:
+        return refreshed
+
+    if diag.get("isExpired"):
+        logger.warning(f"Yoto access_token is expired and could not be refreshed: {diag.get('summary')}")
+        return None
+    return token_data
 
 
 def get_yoto_token(override_client_id: Optional[str] = None) -> Optional[str]:
     token_data = load_yoto_token_data()
     if not token_data:
         return None
-    token_data = refresh_yoto_token_if_needed(token_data, override_client_id) or token_data
-    access_token = token_data.get("access_token")
+    refreshed_data = refresh_yoto_token_if_needed(token_data, override_client_id)
+    if not refreshed_data:
+        return None
+    access_token = refreshed_data.get("access_token")
     return access_token.strip() if isinstance(access_token, str) and access_token.strip() else None
 
 
@@ -491,6 +652,10 @@ def enrich_card_with_local_state(card: Dict[str, Any], state: Dict[str, Any]) ->
         track_url = str(tr.get("trackUrl") or "")
         sha = tr.get("transcodedSha256") or (track_url[6:] if track_url.startswith("yoto:#") else None)
         matched = sha_to_track.get(sha) if sha else None
+        icon_16 = tr.get("icon16x16")
+        icon_media_id = tr.get("iconMediaId") or (
+            icon_16[6:] if isinstance(icon_16, str) and icon_16.startswith("yoto:#") else None
+        ) or (matched.get("iconMediaId") if matched else None)
         enriched_tracks.append(
             {
                 **tr,
@@ -499,6 +664,11 @@ def enrich_card_with_local_state(card: Dict[str, Any], state: Dict[str, Any]) ->
                 "spotifyTrackId": tr.get("spotifyTrackId") or (matched.get("spotifyTrackId") if matched else None),
                 "duration": tr.get("duration") or (matched.get("duration") if matched else None),
                 "fileSize": tr.get("fileSize") or (matched.get("fileSize") if matched else None),
+                "format": tr.get("format") or (matched.get("format") if matched else None),
+                "channels": tr.get("channels") or (matched.get("channels") if matched else None),
+                "iconMediaId": icon_media_id,
+                "icon16x16": icon_16 or (f"yoto:#{icon_media_id}" if icon_media_id else None),
+                "imageUrl": tr.get("imageUrl") or (matched.get("imageUrl") if matched else None),
             }
         )
 
@@ -527,6 +697,8 @@ def parse_single_yoto_card(item: Dict[str, Any], state: Optional[Dict[str, Any]]
     for c_idx, ch in enumerate(raw_chapters, start=1):
         if not isinstance(ch, dict):
             continue
+        ch_display = ch.get("display") if isinstance(ch.get("display"), dict) else {}
+        ch_icon = ch_display.get("icon16x16")
         raw_tracks = ch.get("tracks") if isinstance(ch.get("tracks"), list) else []
         parsed_ch_tracks: List[Dict[str, Any]] = []
         for t_idx, t in enumerate(raw_tracks, start=1):
@@ -537,15 +709,27 @@ def parse_single_yoto_card(item: Dict[str, Any], state: Optional[Dict[str, Any]]
             dur = t.get("duration") if isinstance(t.get("duration"), (int, float)) else None
             if dur:
                 total_duration += int(dur)
+            t_display = t.get("display") if isinstance(t.get("display"), dict) else {}
+            t_icon = t_display.get("icon16x16") or ch_icon
+            icon_media_id = t_icon[6:] if isinstance(t_icon, str) and t_icon.startswith("yoto:#") else None
+            # When using 1-chapter-per-song layout, display the chapter number or overlayLabel
+            display_key = str(
+                ch.get("overlayLabel")
+                or t.get("overlayLabel")
+                or (ch.get("key") if len(raw_tracks) == 1 else t.get("key"))
+                or f"{len(flat_tracks) + 1:02d}"
+            )
             tr_obj = {
-                "key": str(t.get("key") or f"{t_idx:02d}"),
-                "title": str(t.get("title") or ch.get("title") or f"Track {t_idx}"),
+                "key": display_key,
+                "title": str(t.get("title") or ch.get("title") or f"Track {len(flat_tracks) + 1}"),
                 "trackUrl": track_url,
                 "transcodedSha256": sha,
                 "duration": int(dur) if dur is not None else None,
                 "fileSize": int(t["fileSize"]) if isinstance(t.get("fileSize"), (int, float)) else None,
                 "format": str(t["format"]) if t.get("format") else None,
                 "channels": str(t["channels"]) if t.get("channels") else None,
+                "icon16x16": t_icon,
+                "iconMediaId": icon_media_id,
             }
             parsed_ch_tracks.append(tr_obj)
             flat_tracks.append(tr_obj)
@@ -554,6 +738,8 @@ def parse_single_yoto_card(item: Dict[str, Any], state: Optional[Dict[str, Any]]
             {
                 "key": str(ch.get("key") or f"{c_idx:02d}"),
                 "title": str(ch.get("title") or f"Chapter {c_idx}"),
+                "overlayLabel": str(ch.get("overlayLabel") or c_idx),
+                "icon16x16": ch_icon,
                 "duration": int(ch["duration"]) if isinstance(ch.get("duration"), (int, float)) else None,
                 "fileSize": int(ch["fileSize"]) if isinstance(ch.get("fileSize"), (int, float)) else None,
                 "tracks": parsed_ch_tracks,
@@ -639,7 +825,7 @@ def verify_yoto_connection_via_mine(
     )
 
     if not access_token:
-        return bool(cached_cards), cached_profile, cached_cards
+        return False, cached_profile, cached_cards
 
     try:
         resp = requests.get(
@@ -647,6 +833,24 @@ def verify_yoto_connection_via_mine(
             headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
             timeout=15,
         )
+        if resp.status_code in (401, 403):
+            refreshed = force_refresh_yoto_token(token_data, override_client_id)
+            if refreshed and refreshed.get("access_token"):
+                access_token = str(refreshed["access_token"]).strip()
+                token_data = refreshed
+                resp = requests.get(
+                    f"{YOTO_API_BASE}/content/mine",
+                    headers={"Authorization": f"Bearer {access_token}", "Accept": "application/json"},
+                    timeout=15,
+                )
+
+        if resp.status_code in (401, 403):
+            diag = describe_yoto_token_diagnostics(token_data)
+            logger.warning(
+                f"Yoto GET /content/mine returned {resp.status_code}: {diag.get('summary')}"
+            )
+            return False, cached_profile, cached_cards
+
         if resp.status_code != 200:
             if cached_cards:
                 return True, cached_profile, cached_cards
@@ -745,6 +949,10 @@ def build_playlist_payload(raw_pl: Dict[str, Any], sp: spotipy.Spotify, state: D
 
         cached_entry = tracks_map.get(tid)
         is_cached = bool(cached_entry and cached_entry.get("transcodedSha256"))
+        icon_media_id = (
+            (cached_entry.get("iconMediaId") if cached_entry else None)
+            or (state.get("icons") or {}).get(image_url or "")
+        )
 
         parsed_tracks.append(
             {
@@ -761,6 +969,10 @@ def build_playlist_payload(raw_pl: Dict[str, Any], sp: spotipy.Spotify, state: D
                 "transcodedSha256": cached_entry.get("transcodedSha256") if cached_entry else None,
                 "localFilePath": cached_entry.get("localFilePath") if cached_entry else None,
                 "fileSize": cached_entry.get("fileSize") if cached_entry else None,
+                "format": cached_entry.get("format") if cached_entry else None,
+                "channels": cached_entry.get("channels") if cached_entry else None,
+                "iconMediaId": icon_media_id,
+                "icon16x16": f"yoto:#{icon_media_id}" if icon_media_id else None,
                 "syncedAt": cached_entry.get("syncedAt") if cached_entry else None,
             }
         )
@@ -1319,11 +1531,151 @@ def download_track_with_zotify(
 
 
 
-class YotoClient:
-    """Official Yoto Developer API 4-step upload and MYO playlist creation client."""
+_ICON_PNG_CACHE: Dict[str, bytes] = {}
 
-    def __init__(self, access_token: str, base_url: str = YOTO_API_BASE):
+
+def _build_pure_python_16x16_png(seed: str) -> bytes:
+    """
+    Pure-Python fallback that generates a valid 16x16 RGBA PNG pixel-art music note icon
+    using colors derived from the track/album seed string (zero external C dependencies).
+    """
+    digest = hashlib.sha256(seed.encode("utf-8")).digest()
+    bg_r, bg_g, bg_b = 18 + (digest[0] % 40), 18 + (digest[1] % 40), 28 + (digest[2] % 55)
+    fg_r = 130 + (digest[3] % 125)
+    fg_g = 110 + (digest[4] % 145)
+    fg_b = 90 + (digest[5] % 165)
+    acc_r = 255
+    acc_g = 150 + (digest[6] % 100)
+    acc_b = 60 + (digest[7] % 120)
+
+    # 16x16 musical note + vinyl disc pixel pattern
+    note_mask = [
+        "................",
+        "......#######...",
+        "......#######...",
+        "......##...##...",
+        "......##...##...",
+        "......##...##...",
+        "......##...##...",
+        "......##...##...",
+        "....####...##...",
+        "...#####.####...",
+        "...#####.####...",
+        "....###..####...",
+        "..........##....",
+        "................",
+        "..************..",
+        "................",
+    ]
+
+    raw_rows = bytearray()
+    for y in range(16):
+        raw_rows.append(0)  # PNG filter type 0 (None)
+        row_pattern = note_mask[y]
+        for x in range(16):
+            ch = row_pattern[x]
+            if ch == "#":
+                raw_rows.extend((fg_r, fg_g, fg_b, 255))
+            elif ch == "*":
+                raw_rows.extend((acc_r, acc_g, acc_b, 255))
+            else:
+                # Subtle border shading
+                if x in (0, 15) or y in (0, 15):
+                    raw_rows.extend((max(0, bg_r - 10), max(0, bg_g - 10), max(0, bg_b - 10), 255))
+                else:
+                    raw_rows.extend((bg_r, bg_g, bg_b, 255))
+
+    def make_chunk(chunk_type: bytes, chunk_data: bytes) -> bytes:
+        crc = zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF
+        return struct.pack(">I", len(chunk_data)) + chunk_type + chunk_data + struct.pack(">I", crc)
+
+    ihdr = struct.pack(">IIBBBBB", 16, 16, 8, 6, 0, 0, 0)  # 16x16, 8-bit RGBA
+    idat = zlib.compress(bytes(raw_rows), 9)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + make_chunk(b"IHDR", ihdr)
+        + make_chunk(b"IDAT", idat)
+        + make_chunk(b"IEND", b"")
+    )
+
+
+def generate_16x16_pixel_icon_bytes(image_url: Optional[str], fallback_seed: str = "yotofy") -> bytes:
+    """
+    Dynamically creates a vibrant 16x16 PNG icon for the Yoto Player LED matrix from
+    real Spotify album art. Crops to center square, boosts saturation & contrast for
+    Yoto's 16x16 RGB LED display, quantizes/resizes to 16x16 PNG, and falls back to
+    a procedural 16x16 pixel-art icon if album art cannot be fetched.
+    """
+    cache_key = f"{image_url or ''}::{fallback_seed}"
+    if cache_key in _ICON_PNG_CACHE:
+        return _ICON_PNG_CACHE[cache_key]
+
+    if image_url and image_url.strip() and HAS_PIL:
+        try:
+            resp = requests.get(image_url.strip(), timeout=12)
+            if resp.status_code == 200 and resp.content:
+                with Image.open(io.BytesIO(resp.content)) as img:
+                    rgba = img.convert("RGBA")
+                    w, h = rgba.size
+                    if w != h:
+                        side = min(w, h)
+                        left = (w - side) // 2
+                        top = (h - side) // 2
+                        rgba = rgba.crop((left, top, left + side, top + side))
+
+                    # Boost color saturation and contrast so the 16x16 Yoto LED display pops
+                    rgb = rgba.convert("RGB")
+                    rgb = ImageEnhance.Color(rgb).enhance(1.35)
+                    rgb = ImageEnhance.Contrast(rgb).enhance(1.2)
+
+                    resample_filter = getattr(Image, "Resampling", Image).LANCZOS
+                    small_16 = rgb.resize((16, 16), resample=resample_filter).convert("RGBA")
+
+                    out_buf = io.BytesIO()
+                    small_16.save(out_buf, format="PNG", optimize=True)
+                    png_bytes = out_buf.getvalue()
+                    if png_bytes:
+                        _ICON_PNG_CACHE[cache_key] = png_bytes
+                        return png_bytes
+        except Exception as exc:
+            logger.debug(f"Album art 16x16 conversion fell back to procedural icon ({image_url}): {exc}")
+
+    png_bytes = _build_pure_python_16x16_png(fallback_seed or image_url or "yotofy")
+    _ICON_PNG_CACHE[cache_key] = png_bytes
+    return png_bytes
+
+
+def generate_16x16_icon_grid_hex(image_url: Optional[str], fallback_seed: str = "yotofy") -> Optional[List[str]]:
+    """
+    Returns a 256-element list of '#RRGGBB' hex strings representing the 16x16 LED matrix
+    for the frontend YotoDisplay component.
+    """
+    if not HAS_PIL:
+        return None
+    try:
+        png_bytes = generate_16x16_pixel_icon_bytes(image_url, fallback_seed)
+        with Image.open(io.BytesIO(png_bytes)) as img:
+            rgb = img.convert("RGB").resize((16, 16))
+            pixels = list(rgb.getdata())
+            if len(pixels) == 256:
+                return [f"#{r:02x}{g:02x}{b:02x}" for (r, g, b) in pixels]
+    except Exception:
+        pass
+    return None
+
+
+class YotoClient:
+    """Official Yoto Developer API 4-step upload, 16x16 displayIcon upload, and MYO playlist creation client."""
+
+    def __init__(
+        self,
+        access_token: str,
+        base_url: str = YOTO_API_BASE,
+        override_client_id: Optional[str] = None,
+    ):
         self.base_url = base_url
+        self.access_token = access_token
+        self.override_client_id = override_client_id
         self.session = requests.Session()
         self.session.headers.update(
             {
@@ -1332,8 +1684,31 @@ class YotoClient:
             }
         )
 
+    def _request_with_auto_refresh(self, method: str, url: str, **kwargs) -> requests.Response:
+        resp = self.session.request(method, url, **kwargs)
+        if resp.status_code in (401, 403):
+            refreshed = force_refresh_yoto_token(override_client_id=self.override_client_id)
+            if refreshed and refreshed.get("access_token"):
+                new_token = str(refreshed["access_token"]).strip()
+                if new_token and new_token != self.access_token:
+                    self.access_token = new_token
+                    self.session.headers["Authorization"] = f"Bearer {self.access_token}"
+                    resp = self.session.request(method, url, **kwargs)
+        return resp
+
     def get_upload_url(self) -> Dict[str, str]:
-        resp = self.session.get(f"{self.base_url}/media/transcode/audio/uploadUrl", timeout=30)
+        url = f"{self.base_url}/media/transcode/audio/uploadUrl"
+        resp = self._request_with_auto_refresh("GET", url, timeout=30)
+        if resp.status_code in (401, 403):
+            diag = describe_yoto_token_diagnostics()
+            body_preview = (resp.text or "").strip()[:300]
+            raise PermissionError(
+                f"{resp.status_code} Client Error: Forbidden for url: {url}\n"
+                f"Diagnosis: {diag.get('summary')}\n"
+                f"Token Details: expired={diag.get('isExpired')}, expires_at={diag.get('expiresAtIso') or 'unknown'}, "
+                f"has_refresh_token={diag.get('hasRefreshToken')}, scopes='{diag.get('scopes') or 'none'}'\n"
+                f"Yoto Gateway Response: {body_preview}"
+            )
         resp.raise_for_status()
         data = resp.json()
         upload = data.get("upload") or data
@@ -1352,7 +1727,7 @@ class YotoClient:
     def poll_transcode_status(self, upload_id: str, max_attempts: int = 60, interval: float = 3.0) -> Dict[str, Any]:
         url = f"{self.base_url}/media/upload/{upload_id}/transcoded?loudnorm=false"
         for _ in range(max_attempts):
-            resp = self.session.get(url, timeout=30)
+            resp = self._request_with_auto_refresh("GET", url, timeout=30)
             if resp.status_code == 200:
                 data = resp.json()
                 transcode = data.get("transcode") or data
@@ -1361,10 +1736,121 @@ class YotoClient:
             time.sleep(interval)
         raise TimeoutError(f"Timed out waiting for transcodedSha256 (uploadId={upload_id})")
 
-    def upload_and_transcode_track(self, file_path: Path) -> Dict[str, Any]:
-        step1 = self.get_upload_url()
+    def upload_and_transcode_track(
+        self,
+        file_path: Path,
+        preflight_upload: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        step1 = preflight_upload or self.get_upload_url()
         self.put_audio_file(step1["uploadUrl"], file_path)
         return self.poll_transcode_status(step1["uploadId"])
+
+    def upload_custom_display_icon(self, png_bytes: bytes, filename_hint: str = "track_icon") -> Optional[str]:
+        """
+        Uploads a 16x16 PNG icon to Yoto's custom display icons endpoint:
+        POST https://api.yotoplay.com/media/displayIcons/user/me/upload?autoConvert=true&filename=...
+        Returns the Yoto `mediaId` (used as `yoto:#<mediaId>` in `display.icon16x16`).
+        """
+        safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in filename_hint)[:32] or "icon"
+        url = f"{self.base_url}/media/displayIcons/user/me/upload"
+
+        # 1. Try raw image/png body first (official Yoto API pattern for binary image upload)
+        try:
+            resp = self._request_with_auto_refresh(
+                "POST",
+                f"{url}?autoConvert=true&filename={safe_name}.png",
+                data=png_bytes,
+                headers={"Content-Type": "image/png"},
+                timeout=30,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                icon_obj = data.get("displayIcon") or data
+                media_id = icon_obj.get("mediaId") or icon_obj.get("displayIconId") or icon_obj.get("id")
+                if media_id:
+                    return str(media_id).strip()
+        except Exception as exc:
+            logger.debug(f"Raw displayIcon upload attempt failed, trying multipart: {exc}")
+
+        # 2. Fallback to multipart/form-data upload
+        try:
+            resp = self._request_with_auto_refresh(
+                "POST",
+                f"{url}?autoConvert=true&filename={safe_name}",
+                files={"file": (f"{safe_name}.png", png_bytes, "image/png")},
+                timeout=30,
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                icon_obj = data.get("displayIcon") or data
+                media_id = icon_obj.get("mediaId") or icon_obj.get("displayIconId") or icon_obj.get("id")
+                if media_id:
+                    return str(media_id).strip()
+            else:
+                logger.warning(f"Yoto displayIcon upload returned {resp.status_code}: {(resp.text or '')[:200]}")
+        except Exception as exc:
+            logger.warning(f"Failed to upload 16x16 displayIcon to Yoto: {exc}")
+
+        return None
+
+    def ensure_track_icon_media_id(
+        self,
+        image_url: Optional[str],
+        track_id: str,
+        track_title: str,
+    ) -> Optional[str]:
+        """
+        Generates a 16x16 pixel icon from the track's Spotify album art URL (or procedural fallback),
+        uploads it to Yoto once per unique album art URL, and caches the resulting `mediaId` in state.json.
+        """
+        cache_key = (image_url or "").strip() or f"track:{track_id}"
+        cached_media_id = store.get_cached_icon(cache_key)
+        if cached_media_id:
+            return cached_media_id
+
+        png_bytes = generate_16x16_pixel_icon_bytes(image_url, fallback_seed=f"{track_id}:{track_title}")
+        media_id = self.upload_custom_display_icon(png_bytes, filename_hint=f"yotofy_{track_id[:12]}")
+        if media_id:
+            store.save_cached_icon(cache_key, media_id)
+            logger.info(f"Uploaded 16x16 album-art icon for '{track_title}' -> yoto:#{media_id}")
+        return media_id
+
+    def upload_cover_image(self, image_url: Optional[str]) -> Optional[str]:
+        """
+        Downloads the playlist/album cover art and uploads it to Yoto's cover image endpoint:
+        POST https://api.yotoplay.com/media/coverImage/user/me/upload?autoconvert=true&coverType=default
+        Returns the Yoto `mediaUrl` for `metadata.cover.imageL`.
+        """
+        if not image_url or not image_url.strip():
+            return None
+        clean_url = image_url.strip()
+        cached_cover = store.get_cached_cover(clean_url)
+        if cached_cover:
+            return cached_cover
+
+        try:
+            img_resp = requests.get(clean_url, timeout=15)
+            if img_resp.status_code != 200 or not img_resp.content:
+                return clean_url
+            content_type = img_resp.headers.get("Content-Type") or "image/jpeg"
+            up_resp = self._request_with_auto_refresh(
+                "POST",
+                f"{self.base_url}/media/coverImage/user/me/upload?autoconvert=true&coverType=default",
+                data=img_resp.content,
+                headers={"Content-Type": content_type},
+                timeout=30,
+            )
+            if up_resp.status_code in (200, 201):
+                data = up_resp.json()
+                cover_obj = data.get("coverImage") or data
+                media_url = cover_obj.get("mediaUrl") or cover_obj.get("imageL")
+                if media_url:
+                    store.save_cached_cover(clean_url, str(media_url))
+                    return str(media_url)
+        except Exception as exc:
+            logger.debug(f"Cover image upload to Yoto skipped ({clean_url}): {exc}")
+
+        return clean_url
 
     def upsert_myo_content(
         self,
@@ -1372,39 +1858,102 @@ class YotoClient:
         description: str,
         tracks_payload: List[Dict[str, Any]],
         card_id: Optional[str] = None,
+        cover_image_url: Optional[str] = None,
     ) -> Dict[str, Any]:
-        chapter_tracks = [
-            {
-                "key": f"{idx:02d}",
+        """
+        Builds and posts a hardware-compatible Yoto MYO Card payload (`POST /content`).
+        Crucial for physical Yoto Player playback & track numbering:
+        1. Each song is placed in its own Chapter (`chapters[idx-1]`) with `key: f"{idx:02d}"`
+           and `overlayLabel: str(idx)` so tracks are numbered 1, 2, 3... instead of all '1.',
+           and the physical Yoto Player knob/buttons can seek and play each track properly.
+        2. Each track uses the exact `format` and `channels` returned by Yoto's `transcodedInfo`
+           (instead of hardcoded assumptions) along with accurate `duration` and `fileSize`.
+        3. Both the chapter and track include `display: {"icon16x16": "yoto:#<mediaId>"}` when
+           a 16x16 album-art icon is available.
+        4. Top-level `metadata.media` includes `duration`, `fileSize`, `readableDuration`,
+           `readableFileSize`, and `hasStreams: False`, and `content.config` includes
+           `resumeTimeout: 2592000` so the Yoto Player firmware downloads and caches the card.
+        """
+        chapters: List[Dict[str, Any]] = []
+        total_duration = 0
+        total_file_size = 0
+
+        for idx, t in enumerate(tracks_payload, start=1):
+            dur = max(1, int(t.get("duration") or 180))
+            fsize = max(0, int(t.get("fileSize") or 0))
+            fmt = str(t.get("format") or "aac").lower()
+            chans = str(t.get("channels") or "stereo").lower()
+            icon_media_id = t.get("iconMediaId")
+            display_obj = (
+                {"icon16x16": f"yoto:#{icon_media_id}"}
+                if icon_media_id
+                else {"icon16x16": None}
+            )
+
+            total_duration += dur
+            total_file_size += fsize
+
+            track_entry: Dict[str, Any] = {
+                "key": "01",
                 "title": t["title"],
                 "trackUrl": f"yoto:#{t['transcodedSha256']}",
-                "duration": t.get("duration", 0),
-                "fileSize": t.get("fileSize", 0),
-                "format": "aac",
+                "duration": dur,
+                "fileSize": fsize,
+                "format": fmt,
                 "type": "audio",
-                "channels": "stereo",
+                "channels": chans,
+                "overlayLabel": str(idx),
+                "display": display_obj,
             }
-            for idx, t in enumerate(tracks_payload, start=1)
-        ]
+
+            chapter_entry: Dict[str, Any] = {
+                "key": f"{idx:02d}",
+                "title": t["title"],
+                "overlayLabel": str(idx),
+                "duration": dur,
+                "fileSize": fsize,
+                "display": display_obj,
+                "tracks": [track_entry],
+            }
+            chapters.append(chapter_entry)
+
+        hrs = total_duration // 3600
+        mins = (total_duration % 3600) // 60
+        secs = total_duration % 60
+        readable_duration = f"{hrs}h {mins}m" if hrs > 0 else f"{mins}m {secs}s"
+        readable_size = f"{round(total_file_size / (1024 * 1024), 1)} MB" if total_file_size > 0 else "0 MB"
+
+        metadata_obj: Dict[str, Any] = {
+            "description": description or f"Synced by Yotofy ({len(chapters)} tracks)",
+            "media": {
+                "duration": total_duration,
+                "fileSize": total_file_size,
+                "readableDuration": readable_duration,
+                "readableFileSize": readable_size,
+                "hasStreams": False,
+            },
+        }
+        if cover_image_url:
+            metadata_obj["cover"] = {"imageL": cover_image_url}
+
         body: Dict[str, Any] = {
             "title": title,
-            "metadata": {"description": description or f"Synced by Yotofy ({len(chapter_tracks)} tracks)"},
+            "metadata": metadata_obj,
             "content": {
                 "playbackType": "linear",
-                "chapters": [
-                    {
-                        "key": "01",
-                        "title": title,
-                        "overlayLabel": "1",
-                        "tracks": chapter_tracks,
-                    }
-                ],
+                "activity": "yoto_Player",
+                "version": "1",
+                "config": {
+                    "resumeTimeout": 2592000,
+                },
+                "chapters": chapters,
             },
         }
         if card_id:
             body["cardId"] = card_id
 
-        resp = self.session.post(
+        resp = self._request_with_auto_refresh(
+            "POST",
             f"{self.base_url}/content",
             json=body,
             headers={"Content-Type": "application/json"},
@@ -1835,6 +2384,7 @@ def api_status(request: Request):
     spotify_profile = get_spotify_user_profile(req_sp_client_id)
     sp_client = create_spotify_client(req_sp_client_id)
     yoto_verified, yoto_profile, yoto_cards = verify_yoto_connection_via_mine(req_yoto_client_id)
+    yoto_diag = describe_yoto_token_diagnostics()
 
     return {
         "spotify": bool(spotify_profile or sp_client is not None),
@@ -1846,6 +2396,7 @@ def api_status(request: Request):
         "spotifyUser": spotify_profile,
         "yotoUser": yoto_profile,
         "yotoCards": yoto_cards,
+        "yotoTokenDiagnostics": yoto_diag,
         "cachedTracksCount": len(state.get("tracks", {})),
         "settings": state.get("settings", DEFAULT_SETTINGS),
     }
@@ -1937,6 +2488,23 @@ def api_yoto_card_detail(card_id: str, request: Request):
 def api_activity():
     state = store.load()
     return state.get("activity", [])
+
+
+@app.get("/api/icons/preview")
+def api_icon_preview(
+    url: Optional[str] = Query(default=None),
+    seed: Optional[str] = Query(default="yotofy"),
+):
+    """
+    Dynamically generates and returns a 16x16 PNG pixel-art icon from a Spotify album art URL
+    (or procedural fallback) so the Web UI can preview the exact 16x16 Yoto LED icon for every song.
+    """
+    png_bytes = generate_16x16_pixel_icon_bytes(url, fallback_seed=seed or "yotofy")
+    return Response(
+        content=png_bytes,
+        media_type="image/png",
+        headers={"Cache-Control": "public, max-age=86400"},
+    )
 
 
 @app.get("/api/logs")
@@ -2291,6 +2859,7 @@ def api_save_settings(payload: SettingsUpdateRequest, request: Request):
 @app.post("/api/sync")
 def api_sync(req: SyncRequest, request: Request):
     req_client_id = extract_request_client_id(request, req.spotifyClientId)
+    req_yoto_client_id = extract_request_yoto_client_id(request, req.yotoClientId)
     sp = create_spotify_client(req_client_id)
     if sp is None:
         store.add_activity(
@@ -2303,16 +2872,20 @@ def api_sync(req: SyncRequest, request: Request):
             detail="Spotify account is not connected. Please connect Spotify in Config first.",
         )
 
-    yoto_token = get_yoto_token()
+    yoto_token = get_yoto_token(req_yoto_client_id)
     if not yoto_token or len(yoto_token) <= 8:
+        yoto_diag = describe_yoto_token_diagnostics()
+        err_detail = yoto_diag.get("summary") or "Yoto account is not connected. Please connect Yoto in Config first."
+        logger.error(f"Sync aborted: {err_detail}")
         store.add_activity(
             "System",
-            "Sync aborted: Yoto account not connected",
+            "Sync aborted: Yoto token missing or expired",
             "error",
+            err_detail,
         )
         raise HTTPException(
             status_code=400,
-            detail="Yoto account is not connected. Please connect Yoto in Config first.",
+            detail=err_detail,
         )
 
     state = store.load()
@@ -2330,9 +2903,31 @@ def api_sync(req: SyncRequest, request: Request):
     creds_exists = creds_path.exists()
     creds_size = creds_path.stat().st_size if creds_exists else 0
 
+    yoto = YotoClient(access_token=yoto_token, override_client_id=req_yoto_client_id)
+    needs_yoto_upload = any(
+        not (store.get_track(t["id"]) or {}).get("transcodedSha256")
+        for t in tracks
+    )
+    preflight_upload: Optional[Dict[str, str]] = None
+    if needs_yoto_upload:
+        try:
+            preflight_upload = yoto.get_upload_url()
+        except Exception as exc:
+            err_msg = f"Yoto upload pre-flight check failed before downloading tracks: {exc}"
+            logger.error(err_msg)
+            store.add_activity(
+                playlist_name,
+                "Yoto upload authorization failed (403 Forbidden)",
+                "error",
+                str(exc),
+            )
+            raise HTTPException(status_code=403, detail=str(exc))
+
+    yoto_diag = describe_yoto_token_diagnostics()
     start_details = (
         f"Playlist ID: {req.playlistId} | Tracks: {len(tracks)}\n"
         f"Credentials: {creds_path} (exists={creds_exists}, size={creds_size}B)\n"
+        f"Yoto Token: {yoto_diag.get('summary')}\n"
         f"Target Card: {'+ Create New' if req.createNew else (req.targetYotoId or 'default')}"
     )
     logger.info(f"Started sync for '{playlist_name}' ({len(tracks)} tracks)", extra={"details": start_details})
@@ -2343,22 +2938,79 @@ def api_sync(req: SyncRequest, request: Request):
         start_details,
     )
 
-    yoto = YotoClient(access_token=yoto_token)
     synced_tracks_for_card: List[Dict[str, Any]] = []
     last_failure_diag: Optional[str] = None
+    icon_upload_count = 0
 
     for track in tracks:
         tid = track["id"]
+        track_image_url = track.get("imageUrl") or playlist_data.get("imageUrl") or ""
         cached = store.get_track(tid)
+
         if cached and cached.get("transcodedSha256"):
+            sha256 = cached["transcodedSha256"]
+            duration_sec = int(cached.get("duration") or track.get("durationSec", 180))
+            file_size = int(cached.get("fileSize") or 0)
+            audio_format = cached.get("format")
+            channels = cached.get("channels")
+            local_path_str = cached.get("localFilePath")
+            local_mp3 = Path(local_path_str) if local_path_str else (AUDIO_DIR / f"{tid}.mp3")
+
+            # If this track was cached before format/channels metadata was recorded and local MP3 exists,
+            # re-query Yoto transcode metadata from the cached MP3 (without running Zotify) so Yoto Player hardware
+            # receives the exact codec format, channel count, and file size.
+            if (not audio_format or not channels or not file_size) and local_mp3.exists():
+                try:
+                    t_info = yoto.upload_and_transcode_track(local_mp3)
+                    t_meta = t_info.get("transcodedInfo") or {}
+                    sha256 = t_info.get("transcodedSha256") or sha256
+                    duration_sec = int(t_meta.get("duration") or duration_sec)
+                    file_size = int(t_meta.get("fileSize") or local_mp3.stat().st_size)
+                    audio_format = str(t_meta.get("format") or "aac")
+                    channels = str(t_meta.get("channels") or "stereo")
+                except Exception as exc:
+                    logger.debug(f"Cached MP3 transcode metadata refresh skipped for {tid}: {exc}")
+                    if not file_size and local_mp3.exists():
+                        file_size = local_mp3.stat().st_size
+                    audio_format = audio_format or "aac"
+                    channels = channels or "stereo"
+
+            icon_media_id = cached.get("iconMediaId")
+            if not icon_media_id:
+                icon_media_id = yoto.ensure_track_icon_media_id(
+                    image_url=track_image_url,
+                    track_id=tid,
+                    track_title=track["title"],
+                )
+                if icon_media_id:
+                    icon_upload_count += 1
+
+            store.save_track(
+                track_id=tid,
+                transcoded_sha256=sha256,
+                title=cached.get("title") or track["title"],
+                artist=cached.get("artist") or track["artist"],
+                duration_sec=duration_sec,
+                file_size=file_size,
+                local_file_path=str(local_mp3) if local_mp3.exists() else local_path_str,
+                audio_format=audio_format or "aac",
+                channels=channels or "stereo",
+                icon_media_id=icon_media_id,
+                image_url=track_image_url,
+            )
+
             synced_tracks_for_card.append(
                 {
                     "spotifyTrackId": tid,
                     "title": cached.get("title") or track["title"],
                     "artist": cached.get("artist") or track["artist"],
-                    "transcodedSha256": cached["transcodedSha256"],
-                    "duration": cached.get("duration") or track.get("durationSec", 180),
-                    "fileSize": cached.get("fileSize") or 0,
+                    "transcodedSha256": sha256,
+                    "duration": duration_sec,
+                    "fileSize": file_size,
+                    "format": audio_format or "aac",
+                    "channels": channels or "stereo",
+                    "iconMediaId": icon_media_id,
+                    "imageUrl": track_image_url,
                 }
             )
             continue
@@ -2389,16 +3041,26 @@ def api_sync(req: SyncRequest, request: Request):
         )
 
         try:
-            transcode_info = yoto.upload_and_transcode_track(mp3_path)
+            current_preflight = preflight_upload
+            preflight_upload = None
+            transcode_info = yoto.upload_and_transcode_track(
+                mp3_path,
+                preflight_upload=current_preflight,
+            )
             sha256 = transcode_info["transcodedSha256"]
-            duration_sec = int(
-                (transcode_info.get("transcodedInfo") or {}).get("duration")
-                or track.get("durationSec", 180)
+            t_meta = transcode_info.get("transcodedInfo") or {}
+            duration_sec = int(t_meta.get("duration") or track.get("durationSec", 180))
+            file_size = int(t_meta.get("fileSize") or mp3_path.stat().st_size)
+            audio_format = str(t_meta.get("format") or "aac")
+            channels = str(t_meta.get("channels") or "stereo")
+
+            icon_media_id = yoto.ensure_track_icon_media_id(
+                image_url=track_image_url,
+                track_id=tid,
+                track_title=track["title"],
             )
-            file_size = int(
-                (transcode_info.get("transcodedInfo") or {}).get("fileSize")
-                or mp3_path.stat().st_size
-            )
+            if icon_media_id:
+                icon_upload_count += 1
 
             store.save_track(
                 track_id=tid,
@@ -2408,6 +3070,10 @@ def api_sync(req: SyncRequest, request: Request):
                 duration_sec=duration_sec,
                 file_size=file_size,
                 local_file_path=str(mp3_path),
+                audio_format=audio_format,
+                channels=channels,
+                icon_media_id=icon_media_id,
+                image_url=track_image_url,
             )
             synced_tracks_for_card.append(
                 {
@@ -2417,14 +3083,31 @@ def api_sync(req: SyncRequest, request: Request):
                     "transcodedSha256": sha256,
                     "duration": duration_sec,
                     "fileSize": file_size,
+                    "format": audio_format,
+                    "channels": channels,
+                    "iconMediaId": icon_media_id,
+                    "imageUrl": track_image_url,
                 }
             )
+            icon_note = f", icon=yoto:#{icon_media_id}" if icon_media_id else ""
             store.add_activity(
                 playlist_name,
                 f"Transcoded '{track['title']}' on Yoto",
                 "info",
-                f"yoto:#{sha256} (duration={duration_sec}s, size={file_size}B)",
+                f"yoto:#{sha256} (format={audio_format}, channels={channels}, duration={duration_sec}s, size={file_size}B{icon_note})",
             )
+        except PermissionError as exc:
+            err_msg = f"Yoto transcode failed for '{track['title']}': {exc}"
+            last_failure_diag = err_msg
+            logger.error(err_msg)
+            store.add_activity(
+                playlist_name,
+                f"Yoto transcode failed for '{track['title']}' (403 Forbidden)",
+                "error",
+                str(exc),
+            )
+            logger.error("Aborting remaining tracks due to Yoto 401/403 authorization error.")
+            break
         except Exception as exc:
             err_msg = f"Yoto transcode failed for '{track['title']}': {exc}"
             last_failure_diag = err_msg
@@ -2446,7 +3129,6 @@ def api_sync(req: SyncRequest, request: Request):
             detail=fail_summary,
         )
 
-
     state = store.load()
     saved_pl = state.get("playlists", {}).get(req.playlistId, {})
     if req.createNew:
@@ -2461,6 +3143,11 @@ def api_sync(req: SyncRequest, request: Request):
         )
 
     effective_title = (req.customTitle or "").strip() or playlist_name
+    cover_art_source = (
+        playlist_data.get("imageUrl")
+        or next((t.get("imageUrl") for t in synced_tracks_for_card if t.get("imageUrl")), None)
+    )
+    yoto_cover_url = yoto.upload_cover_image(cover_art_source)
 
     try:
         card_resp = yoto.upsert_myo_content(
@@ -2468,6 +3155,7 @@ def api_sync(req: SyncRequest, request: Request):
             description=playlist_data.get("description", ""),
             tracks_payload=synced_tracks_for_card,
             card_id=target_card_id,
+            cover_image_url=yoto_cover_url,
         )
     except Exception as exc:
         store.add_activity(effective_title, f"POST /content failed: {exc}", "error")
@@ -2485,23 +3173,29 @@ def api_sync(req: SyncRequest, request: Request):
             detail="Yoto POST /content succeeded but did not return a cardId.",
         )
 
+    generated_icon_grid = generate_16x16_icon_grid_hex(cover_art_source, fallback_seed=effective_title)
     state = store.load()
     sync_config = {
         "enabled": bool(req.autoSync),
         "lastCheck": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "targetYotoId": str(resolved_card_id),
     }
-    state.setdefault("playlists", {})[req.playlistId] = {
+    pl_entry: Dict[str, Any] = {
+        **(state.get("playlists", {}).get(req.playlistId) or {}),
         "id": req.playlistId,
         "name": effective_title,
         "syncConfig": sync_config,
     }
+    if generated_icon_grid:
+        pl_entry["generatedIcon"] = generated_icon_grid
+    state.setdefault("playlists", {})[req.playlistId] = pl_entry
     store.save(state)
 
+    icons_with_id = sum(1 for t in synced_tracks_for_card if t.get("iconMediaId"))
     action_label = "Created new Yoto MYO Playlist" if not target_card_id else "Updated Yoto MYO Playlist"
     store.add_activity(
         effective_title,
-        f"{action_label} '{effective_title}' ({len(synced_tracks_for_card)} tracks) -> cardId: {resolved_card_id}",
+        f"{action_label} '{effective_title}' ({len(synced_tracks_for_card)} chapters/tracks, {icons_with_id} 16x16 icons) -> cardId: {resolved_card_id}",
         "success",
     )
 

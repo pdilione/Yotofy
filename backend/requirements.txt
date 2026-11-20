@@ -5,6 +5,7 @@ python-dotenv>=1.0.1
 requests>=2.32.3
 pydantic>=2.8.0
 mutagen>=1.47.0
+pillow>=10.0.0
 git+https://github.com/Googolplexed0/zotify.git
 
 

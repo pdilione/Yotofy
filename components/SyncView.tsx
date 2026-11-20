@@ -225,6 +225,9 @@ export const SyncView: React.FC<Props> = ({
             ) : (
               tracks.map((track, idx) => {
                 const isCached = Boolean(track.inLocalCache && track.transcodedSha256);
+                const iconPreviewUrl = `/api/icons/preview?url=${encodeURIComponent(
+                  track.imageUrl || currentPlaylist.imageUrl || ''
+                )}&seed=${encodeURIComponent(`${track.id}:${track.title}`)}`;
 
                 return (
                   <div
@@ -238,25 +241,44 @@ export const SyncView: React.FC<Props> = ({
                     <span className="text-gray-500 w-7 text-center text-xs font-mono">
                       {idx + 1}
                     </span>
-                    {track.imageUrl && track.imageUrl.trim() && (
-                      <img
-                        src={track.imageUrl}
-                        alt={track.title}
-                        className="w-10 h-10 rounded mr-3"
-                      />
-                    )}
+                    <div className="relative mr-3 flex items-center gap-1.5 shrink-0">
+                      {track.imageUrl && track.imageUrl.trim() && (
+                        <img
+                          src={track.imageUrl}
+                          alt={track.title}
+                          className="w-10 h-10 rounded object-cover"
+                        />
+                      )}
+                      <div
+                        title="Dynamic 16×16 Yoto LED Pixel Icon generated from album art"
+                        className="w-10 h-10 rounded bg-black/80 border border-yoto-orange/40 p-1 flex items-center justify-center shadow-inner"
+                      >
+                        <img
+                          src={iconPreviewUrl}
+                          alt={`16x16 Yoto Icon for ${track.title}`}
+                          className="w-full h-full [image-rendering:pixelated]"
+                        />
+                      </div>
+                    </div>
                     <div className="flex-1 min-w-0 pr-3">
                       <div className="text-white truncate font-medium text-sm">{track.title}</div>
                       <div className="text-gray-400 text-xs truncate">
                         {track.artist} •{' '}
                         <span className="text-gray-500 font-mono">{track.duration}</span>
                       </div>
-                      {track.transcodedSha256 && (
-                        <div className="text-[10px] text-emerald-400/80 font-mono mt-0.5 flex items-center gap-1 truncate">
-                          <Hash size={10} />
-                          <span>yoto:#{track.transcodedSha256.slice(0, 20)}...</span>
-                        </div>
-                      )}
+                      <div className="flex flex-wrap items-center gap-2 mt-0.5">
+                        {track.transcodedSha256 && (
+                          <div className="text-[10px] text-emerald-400/80 font-mono flex items-center gap-1 truncate">
+                            <Hash size={10} />
+                            <span>yoto:#{track.transcodedSha256.slice(0, 14)}...</span>
+                          </div>
+                        )}
+                        <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-yoto-orange/15 text-yoto-orange border border-yoto-orange/30">
+                          {track.iconMediaId
+                            ? `16×16 Icon: yoto:#${track.iconMediaId.slice(0, 10)}...`
+                            : '16×16 Album Icon Ready'}
+                        </span>
+                      </div>
                     </div>
 
                     <div className="flex flex-col items-end flex-shrink-0">

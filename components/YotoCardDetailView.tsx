@@ -175,8 +175,11 @@ export const YotoCardDetailView: React.FC<Props> = ({
             transcodedSha256: t.transcodedSha256,
             trackUrl: t.transcodedSha256 ? `yoto:#${t.transcodedSha256}` : undefined,
             fileSize: t.fileSize,
-            format: 'aac',
-            channels: 'stereo',
+            format: t.format || 'aac',
+            channels: t.channels || 'stereo',
+            iconMediaId: t.iconMediaId,
+            icon16x16: t.icon16x16,
+            imageUrl: t.imageUrl,
           }))
       : [];
 
@@ -361,50 +364,84 @@ export const YotoCardDetailView: React.FC<Props> = ({
               </div>
             ) : cardTracks.length > 0 ? (
               <div className="max-h-[460px] overflow-y-auto custom-scrollbar pr-1 space-y-2">
-                {cardTracks.map((track, idx) => (
-                  <div
-                    key={`${track.key}-${idx}`}
-                    className="flex items-center justify-between p-3 rounded-xl bg-white/[0.03] hover:bg-white/[0.06] border border-white/5 transition-colors"
-                  >
-                    <div className="flex items-center gap-3 min-w-0 pr-3">
-                      <span className="w-6 text-center text-xs font-mono tabular-nums text-gray-500 shrink-0">
-                        {track.key || String(idx + 1).padStart(2, '0')}
-                      </span>
-                      <div className="w-8 h-8 rounded-lg bg-yoto-orange/15 border border-yoto-orange/25 flex items-center justify-center shrink-0">
-                        <Music size={14} className="text-yoto-orange" />
-                      </div>
-                      <div className="min-w-0">
-                        <p className="text-sm font-medium text-white truncate">
-                          {track.title}
-                        </p>
-                        <div className="flex items-center gap-2 text-xs text-gray-400 truncate">
-                          {track.artist && <span>{track.artist}</span>}
-                          {track.artist && track.transcodedSha256 && (
-                            <span aria-hidden="true">·</span>
-                          )}
-                          {track.transcodedSha256 && (
-                            <span className="font-mono text-[11px] text-emerald-400/80 flex items-center gap-1 truncate">
-                              <Hash size={10} />
-                              yoto:#{track.transcodedSha256.slice(0, 16)}...
-                            </span>
-                          )}
+                {cardTracks.map((track, idx) => {
+                  const matchedSpotifyTrack =
+                    linkedPlaylist?.tracks.find(
+                      (pt) =>
+                        (track.spotifyTrackId && pt.id === track.spotifyTrackId) ||
+                        (track.transcodedSha256 && pt.transcodedSha256 === track.transcodedSha256) ||
+                        pt.title.toLowerCase() === track.title.toLowerCase()
+                    ) || null;
+                  const artUrl =
+                    track.imageUrl ||
+                    matchedSpotifyTrack?.imageUrl ||
+                    cardDetail.coverImageUrl ||
+                    '';
+                  const iconPreviewUrl = `/api/icons/preview?url=${encodeURIComponent(
+                    artUrl
+                  )}&seed=${encodeURIComponent(`${idx + 1}:${track.title}`)}`;
+
+                  return (
+                    <div
+                      key={`${track.key}-${idx}`}
+                      className="flex items-center justify-between p-3 rounded-xl bg-white/[0.03] hover:bg-white/[0.06] border border-white/5 transition-colors"
+                    >
+                      <div className="flex items-center gap-3 min-w-0 pr-3">
+                        <span className="w-6 text-center text-xs font-mono tabular-nums text-gray-400 shrink-0">
+                          {idx + 1}.
+                        </span>
+                        <div
+                          title={
+                            track.icon16x16
+                              ? `16×16 Yoto Icon (${track.icon16x16})`
+                              : '16×16 Yoto LED Pixel Icon'
+                          }
+                          className="w-9 h-9 rounded-lg bg-black/80 border border-yoto-orange/35 p-1 flex items-center justify-center shrink-0"
+                        >
+                          <img
+                            src={iconPreviewUrl}
+                            alt={track.title}
+                            className="w-full h-full [image-rendering:pixelated]"
+                          />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-sm font-medium text-white truncate">
+                            {track.title}
+                          </p>
+                          <div className="flex flex-wrap items-center gap-2 text-xs text-gray-400 truncate">
+                            {track.artist && <span>{track.artist}</span>}
+                            {track.artist && track.transcodedSha256 && (
+                              <span aria-hidden="true">·</span>
+                            )}
+                            {track.transcodedSha256 && (
+                              <span className="font-mono text-[11px] text-emerald-400/80 flex items-center gap-1 truncate">
+                                <Hash size={10} />
+                                yoto:#{track.transcodedSha256.slice(0, 12)}...
+                              </span>
+                            )}
+                            {track.icon16x16 && (
+                              <span className="font-mono text-[10px] px-1.5 py-0.5 rounded bg-yoto-orange/15 text-yoto-orange border border-yoto-orange/30">
+                                icon: {track.icon16x16.slice(0, 14)}...
+                              </span>
+                            )}
+                          </div>
                         </div>
                       </div>
-                    </div>
 
-                    <div className="flex items-center gap-3 text-xs text-gray-400 font-mono tabular-nums shrink-0">
-                      {track.format && (
-                        <span className="uppercase text-gray-500">{track.format}</span>
-                      )}
-                      {track.duration ? (
-                        <span className="flex items-center gap-1">
-                          <Clock size={11} className="text-gray-500" />
-                          {formatSeconds(track.duration)}
-                        </span>
-                      ) : null}
+                      <div className="flex items-center gap-3 text-xs text-gray-400 font-mono tabular-nums shrink-0">
+                        {track.format && (
+                          <span className="uppercase text-gray-500">{track.format}</span>
+                        )}
+                        {track.duration ? (
+                          <span className="flex items-center gap-1">
+                            <Clock size={11} className="text-gray-500" />
+                            {formatSeconds(track.duration)}
+                          </span>
+                        ) : null}
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             ) : (
               <div className="py-12 px-6 text-center bg-black/30 rounded-xl border border-white/5 space-y-2">

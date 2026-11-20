@@ -35,6 +35,14 @@ export interface Track {
   localFilePath?: string;
   /** File size in bytes */
   fileSize?: number;
+  /** Audio codec format returned by Yoto transcodedInfo (e.g. aac or mp3) */
+  format?: string;
+  /** Audio channel configuration returned by Yoto transcodedInfo (e.g. stereo or mono) */
+  channels?: string;
+  /** Yoto 16x16 custom display icon mediaId generated from real album art */
+  iconMediaId?: string;
+  /** Full Yoto icon URI (yoto:#<mediaId>) */
+  icon16x16?: string;
   /** Timestamp when the track was last synced to Yoto */
   syncedAt?: string;
 }
@@ -46,6 +54,10 @@ export interface TrackCacheEntry {
   artist?: string;
   duration?: number;
   fileSize?: number;
+  format?: string;
+  channels?: string;
+  iconMediaId?: string;
+  imageUrl?: string;
   syncedAt?: number;
 }
 
@@ -88,11 +100,16 @@ export interface YotoCardTrackItem {
   channels?: string;
   artist?: string;
   spotifyTrackId?: string;
+  iconMediaId?: string;
+  icon16x16?: string;
+  imageUrl?: string;
 }
 
 export interface YotoCardChapterItem {
   key: string;
   title: string;
+  overlayLabel?: string;
+  icon16x16?: string;
   duration?: number;
   fileSize?: number;
   tracks: YotoCardTrackItem[];

@@ -20,6 +20,8 @@ import {
   setStoredYotoClientId,
   SPOTIFY_PKCE_RESULT_STORAGE_KEY,
   YOTO_PKCE_RESULT_STORAGE_KEY,
+  YOTO_SCOPES_FALLBACK,
+  YotoTokenDiagnostics,
 } from '../services/api';
 import { ZotifyAuthPanel } from './ZotifyAuthPanel';
 import {
@@ -69,6 +71,7 @@ export const SettingsView: React.FC<Props> = ({
     spotifyUser: ConnectedUserProfile | null;
     yotoUser: ConnectedUserProfile | null;
     yotoCards: YotoMyoCard[];
+    yotoTokenDiagnostics: YotoTokenDiagnostics | null;
     cachedTracksCount: number;
   }>({
     spotify: false,
@@ -76,6 +79,7 @@ export const SettingsView: React.FC<Props> = ({
     spotifyUser: null,
     yotoUser: null,
     yotoCards: [],
+    yotoTokenDiagnostics: null,
     cachedTracksCount: 0,
   });
   const [saving, setSaving] = useState(false);
@@ -92,6 +96,7 @@ export const SettingsView: React.FC<Props> = ({
         spotifyUser: res.spotifyUser || null,
         yotoUser: res.yotoUser || null,
         yotoCards: Array.isArray(res.yotoCards) ? res.yotoCards : [],
+        yotoTokenDiagnostics: res.yotoTokenDiagnostics || null,
         cachedTracksCount: res.cachedTracksCount || 0,
       });
       if (res.settings) {
@@ -120,6 +125,7 @@ export const SettingsView: React.FC<Props> = ({
         spotifyUser: null,
         yotoUser: null,
         yotoCards: [],
+        yotoTokenDiagnostics: null,
         cachedTracksCount: 0,
       });
     }
@@ -158,6 +164,17 @@ export const SettingsView: React.FC<Props> = ({
   const handleYotoPkceCodeReceived = useCallback(
     async (code?: string | null, error?: string | null) => {
       if (error) {
+        if (error === 'invalid_scope' && yotoClientId.trim()) {
+          try {
+            await openYotoPkcePopup(yotoClientId.trim(), YOTO_SCOPES_FALLBACK);
+            setErrorMessage(
+              'Note: Your Yoto Developer Dashboard app does not have "offline_access" enabled yet, so we retried login without "offline_access". Enable "offline_access" on yoto.dev for permanent background token refresh.'
+            );
+            return;
+          } catch {
+            // fall through
+          }
+        }
         setConnectingYoto(false);
         setErrorMessage(`Yoto authorization error: ${error}`);
         return;
@@ -502,31 +519,55 @@ export const SettingsView: React.FC<Props> = ({
                   }`}
                 >
                   {statusInfo.yoto ? <CheckCircle size={13} /> : <AlertCircle size={13} />}
-                  {statusInfo.yoto ? 'Connected' : 'Disconnected'}
+                  {statusInfo.yoto
+                    ? 'Connected'
+                    : statusInfo.yotoTokenDiagnostics?.isExpired
+                    ? 'Token Expired'
+                    : 'Disconnected'}
                 </span>
               </div>
 
               {statusInfo.yoto && statusInfo.yotoUser ? (
-                <div className="flex items-center space-x-3 p-2.5 rounded-lg bg-white/5 border border-white/5">
-                  {statusInfo.yotoUser.avatar ? (
-                    <img
-                      src={statusInfo.yotoUser.avatar}
-                      alt={statusInfo.yotoUser.display_name}
-                      className="w-10 h-10 rounded-full object-cover border border-yoto-orange/40"
-                    />
-                  ) : (
-                    <div className="w-10 h-10 rounded-full bg-yoto-orange/20 text-yoto-orange flex items-center justify-center font-bold text-sm">
-                      {statusInfo.yotoUser.display_name.charAt(0).toUpperCase()}
-                    </div>
-                  )}
-                  <div className="min-w-0 flex-1">
-                    <div className="text-sm font-semibold text-white truncate">
-                      {statusInfo.yotoUser.display_name}
-                    </div>
-                    <div className="text-[11px] text-gray-400 truncate">
-                      Verified via GET /content/mine ({statusInfo.yotoCards.length} MYO cards)
+                <div className="space-y-2">
+                  <div className="flex items-center space-x-3 p-2.5 rounded-lg bg-white/5 border border-white/5">
+                    {statusInfo.yotoUser.avatar ? (
+                      <img
+                        src={statusInfo.yotoUser.avatar}
+                        alt={statusInfo.yotoUser.display_name}
+                        className="w-10 h-10 rounded-full object-cover border border-yoto-orange/40"
+                      />
+                    ) : (
+                      <div className="w-10 h-10 rounded-full bg-yoto-orange/20 text-yoto-orange flex items-center justify-center font-bold text-sm">
+                        {statusInfo.yotoUser.display_name.charAt(0).toUpperCase()}
+                      </div>
+                    )}
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-semibold text-white truncate">
+                        {statusInfo.yotoUser.display_name}
+                      </div>
+                      <div className="text-[11px] text-gray-400 truncate">
+                        Verified via GET /content/mine ({statusInfo.yotoCards.length} MYO cards)
+                      </div>
                     </div>
                   </div>
+                  {statusInfo.yotoTokenDiagnostics && (
+                    <div className="text-[11px] text-gray-400 bg-black/40 border border-white/5 rounded-lg px-2.5 py-1.5 font-mono leading-relaxed">
+                      Expires: {statusInfo.yotoTokenDiagnostics.expiresAtIso || '24h'} · Refresh Token:{' '}
+                      <span
+                        className={
+                          statusInfo.yotoTokenDiagnostics.hasRefreshToken
+                            ? 'text-emerald-400 font-bold'
+                            : 'text-amber-300 font-bold'
+                        }
+                      >
+                        {statusInfo.yotoTokenDiagnostics.hasRefreshToken ? 'Active' : 'Missing (Reconnect)'}
+                      </span>
+                    </div>
+                  )}
+                </div>
+              ) : statusInfo.yotoTokenDiagnostics?.isExpired ? (
+                <div className="text-xs text-amber-200 bg-amber-500/10 border border-amber-500/30 rounded-lg p-2.5 leading-relaxed">
+                  {statusInfo.yotoTokenDiagnostics.summary}
                 </div>
               ) : (
                 <div className="text-xs text-gray-500 py-2">
@@ -543,7 +584,7 @@ export const SettingsView: React.FC<Props> = ({
                 <span>
                   {connectingYoto
                     ? 'Waiting for Yoto Popup...'
-                    : statusInfo.yoto
+                    : statusInfo.yoto || statusInfo.yotoTokenDiagnostics?.hasAccessToken
                     ? 'Reconnect Yoto'
                     : 'Connect Yoto'}
                 </span>
